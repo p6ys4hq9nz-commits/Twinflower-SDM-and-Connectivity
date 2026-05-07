@@ -1,0 +1,761 @@
+################################################################################
+###          Script 4: Connectivity analysis and figure plotting             ###
+################################################################################
+
+# Purpose:
+#   Use modelled habitat suitability, future climate stability and local
+#   connectivity to identify and rank candidate translocation patches. The script
+#   also produces the final connectivity and priority-surface figures.
+
+# Load packages ----------------------------------------------------------------
+library(tidyterra)
+library(terra)
+library(raster)
+library(tidyverse)
+library(dismo)
+library(tidyr)
+library(ecospat)
+library(enmSdmX)
+library(viridis)
+library(maxnet)
+library(dplyr)
+library(ggplot2)
+library(gdistance)
+
+# Load custom functions --------------------------------------------------------
+source("E:/Shared drives/Twinflower/Scripts/misc_functions/misc_functions.R")
+
+# Paths ------------------------------------------------------------------------
+base_dir  <- "E:/Shared drives/Twinflower"
+raw_dir   <- file.path(base_dir, "RawData")
+clean_dir <- file.path(base_dir, "CleanData")
+out_dir   <- file.path(base_dir, "Outputs")
+
+simple_out_dir <- file.path(out_dir, "SimpleModelOut")
+fig_dir        <- file.path(out_dir, "final_figures")
+connect_dir    <- file.path(clean_dir, "connectivity")
+
+# Create output directories if needed.
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(connect_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Load ROI for Scotland --------------------------------------------------------
+ROI <- vect(file.path(raw_dir, "ROI_polygon/ROI.shp"))
+
+# Create 50 m template raster --------------------------------------------------
+template <- rast(
+  xmin = xmin(ROI),
+  xmax = xmax(ROI),
+  ymin = ymin(ROI),
+  ymax = ymax(ROI),
+  resolution = 50,
+  crs = crs(ROI)
+)
+
+
+#------------------------------------------------------------------------------#
+###                         Helper functions                                ###
+#------------------------------------------------------------------------------#
+
+crop_mask_roi <- function(x, roi) {
+  crop(x, roi, mask = TRUE)
+}
+
+# Standardise a raster to 0–1. Constant rasters are returned as zero surfaces.
+scale01_raster <- function(r) {
+  rng <- global(r, c("min", "max"), na.rm = TRUE)
+  rmin <- rng[1, "min"]
+  rmax <- rng[1, "max"]
+  
+  if (!is.finite(rmin) || !is.finite(rmax)) {
+    stop("Raster has no finite values.")
+  }
+  
+  if (isTRUE(all.equal(rmin, rmax))) {
+    return(r * 0)
+  }
+  
+  (r - rmin) / (rmax - rmin)
+}
+
+# Standardise a vector to 0–1. Used for patch ranking metrics.
+scale01_vector <- function(x) {
+  if (all(is.na(x))) return(rep(NA_real_, length(x)))
+  
+  rng <- range(x, na.rm = TRUE)
+  if (isTRUE(all.equal(rng[1], rng[2]))) return(rep(0, length(x)))
+  
+  (x - rng[1]) / (rng[2] - rng[1])
+}
+
+# Draw a vertical colour bar in a dedicated plotting panel.
+draw_vertical_legend <- function(cols, zlim, title,
+                                 axis_side = 4,
+                                 bar_x = c(0.7, 0.9),
+                                 title_line = 0.2,
+                                 cex.axis = 0.9,
+                                 cex.title = 0.6) {
+  n <- length(cols)
+  
+  par(mar = c(2, 2, 2, 2))
+  plot.new()
+  plot.window(xlim = c(0, 1), ylim = zlim, xaxs = "i", yaxs = "i")
+  
+  ybreaks <- seq(zlim[1], zlim[2], length.out = n + 1)
+  
+  for (i in seq_len(n)) {
+    rect(
+      xleft   = bar_x[1],
+      ybottom = ybreaks[i],
+      xright  = bar_x[2],
+      ytop    = ybreaks[i + 1],
+      col     = cols[i],
+      border  = NA
+    )
+  }
+  
+  at_vals <- pretty(zlim, n = 8)
+  
+  axis(
+    axis_side,
+    at = at_vals,
+    labels = format(round(at_vals, 2), trim = TRUE),
+    las = 1,
+    cex.axis = cex.axis,
+    lwd = 0.8,
+    lwd.ticks = 0.8
+  )
+  
+  mtext(title, side = 3, line = title_line, cex = cex.title)
+}
+
+# Plot a suitability raster with a consistent legend and BNG axis labels.
+plot_zoomed_suitability_panel <- function(r, boundary, title, legend_ticks) {
+  plot(
+    r,
+    main = title,
+    zlim = c(0, 1),
+    xlab = "Easting (m)",
+    ylab = "Northing (m)",
+    cex.lab = 0.6,
+    plg = list(at = legend_ticks, labels = legend_ticks)
+  )
+  plot(boundary, add = TRUE, border = "red", lwd = 0.35)
+}
+
+# Calculate local connectivity metrics for each candidate patch centroid.
+calculate_candidate_connectivity <- function(candidate_pts, candidate_patches,
+                                             patches, transition_layer,
+                                             max_dist_m) {
+  euclid_mat <- distance(candidate_pts, patches)
+  cand_xy  <- crds(candidate_pts)
+  patch_xy <- crds(patches)
+  
+  candidate_metrics <- vector("list", nrow(candidate_pts))
+  
+  for (i in seq_len(nrow(candidate_pts))) {
+    nearby_idx <- which(euclid_mat[i, ] <= max_dist_m)
+    
+    if (length(nearby_idx) == 0) {
+      candidate_metrics[[i]] <- data.frame(
+        candidate_id = candidate_patches$candidate_id[i],
+        n_nodes_200m = 0,
+        n_wild_200m = 0,
+        n_transloc_200m = 0,
+        nearest_node_euclid_m = NA_real_,
+        nearest_node_cost = NA_real_,
+        mean_cost_to_nearby_nodes = NA_real_,
+        min_cost_to_wild = NA_real_,
+        mean_cost_to_wild = NA_real_
+      )
+      next
+    }
+    
+    cost_vals <- rep(NA_real_, length(nearby_idx))
+    
+    for (k in seq_along(nearby_idx)) {
+      j <- nearby_idx[k]
+      
+      d_ij <- try(
+        costDistance(
+          transition_layer,
+          cand_xy[i, , drop = FALSE],
+          patch_xy[j, , drop = FALSE]
+        ),
+        silent = TRUE
+      )
+      
+      if (!inherits(d_ij, "try-error") && is.finite(d_ij[1, 1])) {
+        cost_vals[k] <- d_ij[1, 1]
+      }
+    }
+    
+    nearby_types <- patches$node_type[nearby_idx]
+    wild_costs   <- cost_vals[nearby_types == "wild"]
+    
+    candidate_metrics[[i]] <- data.frame(
+      candidate_id = candidate_patches$candidate_id[i],
+      n_nodes_200m = length(nearby_idx),
+      n_wild_200m = sum(nearby_types == "wild"),
+      n_transloc_200m = sum(nearby_types == "translocated"),
+      nearest_node_euclid_m = min(euclid_mat[i, nearby_idx], na.rm = TRUE),
+      nearest_node_cost = if (all(is.na(cost_vals))) NA_real_ else min(cost_vals, na.rm = TRUE),
+      mean_cost_to_nearby_nodes = if (all(is.na(cost_vals))) NA_real_ else mean(cost_vals, na.rm = TRUE),
+      min_cost_to_wild = if (length(wild_costs) == 0 || all(is.na(wild_costs))) NA_real_ else min(wild_costs, na.rm = TRUE),
+      mean_cost_to_wild = if (length(wild_costs) == 0 || all(is.na(wild_costs))) NA_real_ else mean(wild_costs, na.rm = TRUE)
+    )
+  }
+  
+  do.call(rbind, candidate_metrics)
+}
+
+# Copy ranked table fields back onto the polygon object for writing/plotting.
+add_rank_fields_to_patches <- function(candidate_patches, candidate_patch_table) {
+  match_idx <- match(candidate_patches$candidate_id, candidate_patch_table$candidate_id)
+  
+  fields_to_copy <- c(
+    "mean_current_suitability",
+    "mean_climate_stability",
+    "mean_priority",
+    "area_m2",
+    "area_ha",
+    "n_nodes_200m",
+    "n_wild_200m",
+    "n_transloc_200m",
+    "nearest_node_euclid_m",
+    "nearest_node_cost",
+    "mean_cost_to_nearby_nodes",
+    "min_cost_to_wild",
+    "mean_cost_to_wild",
+    "site_rank_score",
+    "rank_class"
+  )
+  
+  for (field in fields_to_copy) {
+    candidate_patches[[field]] <- candidate_patch_table[[field]][match_idx]
+  }
+  
+  candidate_patches
+}
+
+
+#------------------------------------------------------------------------------#
+###                  Load suitability rasters and point data                  ###
+#------------------------------------------------------------------------------#
+
+current_scot <- rast(file.path(simple_out_dir, "hs_current_scotland.tif"))
+rcp45_scot   <- rast(file.path(simple_out_dir, "hs_rcp45_scotland.tif"))
+rcp85_scot   <- rast(file.path(simple_out_dir, "hs_rcp85_scotland.tif"))
+
+current_scot <- crop_mask_roi(current_scot, ROI)
+rcp45_scot   <- crop_mask_roi(rcp45_scot, ROI)
+rcp85_scot   <- crop_mask_roi(rcp85_scot, ROI)
+
+# Wild occurrences -------------------------------------------------------------
+tf_occs_raw <- vect(file.path(raw_dir, "Tf_occ_data/Shapefiles/TF_Scot_nodupl.shp"))
+
+# Filter occurrence points to those with precision at or below raster resolution.
+tf_occs_precise <- tf_occs_raw[
+  !is.na(tf_occs_raw$precision_) & tf_occs_raw$precision_ <= 50,
+]
+
+precise_occs_path <- file.path(connect_dir, "precise_occs_50m.shp")
+
+if (nrow(tf_occs_precise) > 0) {
+  writeVector(tf_occs_precise, precise_occs_path, overwrite = TRUE)
+} else {
+  message("No records matched the filter.")
+}
+
+tf_occs_precise <- vect(precise_occs_path)
+
+# Translocations/reintroductions ----------------------------------------------
+translocs_raw <- vect(file.path(
+  raw_dir,
+  "Tf_occ_data/translocations/TwinflowerTranslocationSites2025.shp"
+))
+
+translocs <- project(translocs_raw, ROI)
+translocs_ROI <- crop(translocs, ROI) |> mask(ROI)
+
+# Quick visual check that translocation points are in the expected locations.
+plot(ROI, col = "lightgrey", border = "black")
+points(translocs_ROI, col = "red", pch = 16)
+
+
+#------------------------------------------------------------------------------#
+###                         Suitability figure plots                         ###
+#------------------------------------------------------------------------------#
+
+# Plot translocations over current suitable habitat for a quick local check.
+suitable_current <- rast(file.path(simple_out_dir, "hs_current_scotland.tif"))
+e <- ext(translocs_ROI)
+b <- 20000
+
+e_zoom <- ext(
+  xmin(e) - b,
+  xmax(e) + b,
+  ymin(e) - b,
+  ymax(e) + b
+)
+
+s_zoom <- crop(suitable_current, e_zoom)
+plot(s_zoom)
+points(translocs_ROI, col = "red", pch = 16, cex = 0.6)
+
+# Zoom in on suitable habitat and overlay Cairngorms National Park boundary.
+CNP_boundary <- vect(file.path(raw_dir, "CNP_boundary/SG_CairngormsNationalPark_2010.shp"))
+
+if (!same.crs(tf_occs_raw, current_scot)) tf_occs_raw <- project(tf_occs_raw, current_scot)
+if (!same.crs(translocs_raw, current_scot)) translocs_raw <- project(translocs_raw, current_scot)
+if (!same.crs(CNP_boundary, current_scot)) CNP_boundary <- project(CNP_boundary, current_scot)
+
+e1 <- ext(tf_occs_raw)
+e2 <- ext(translocs_raw)
+
+e <- ext(
+  min(xmin(e1), xmin(e2)),
+  max(xmax(e1), xmax(e2)),
+  min(ymin(e1), ymin(e2)),
+  max(ymax(e1), ymax(e2))
+)
+
+buffer_dist <- 10000
+e_crop <- ext(
+  xmin(e) - buffer_dist,
+  xmax(e) + buffer_dist,
+  ymin(e) - buffer_dist,
+  ymax(e) + buffer_dist
+)
+
+current_crop <- crop(current_scot, e_crop)
+rcp45_crop   <- crop(rcp45_scot, e_crop)
+rcp85_crop   <- crop(rcp85_scot, e_crop)
+CNP_crop     <- crop(CNP_boundary, e_crop)
+
+# Plot each suitability scenario separately -----------------------------------
+options(scipen = 999)
+
+plot_suitability_zoom <- function(r, boundary, title_text, filename) {
+  
+  legend_ticks <- seq(0.2, 1, by = 0.2)
+  
+  png(filename, width = 3000, height = 4200, res = 600)
+  
+  par(
+    mar = c(8, 8, 5, 8),
+    cex.axis = 0.8,
+    cex.main = 1.2
+  )
+  
+  plot(
+    r,
+    col = hcl.colors(50, "viridis"),
+    range = c(0, 1),
+    main = title_text,
+    xlab = "",
+    ylab = "",
+    axes = TRUE,
+    colNA = "white",
+    plg = list(
+      title = "",
+      cex = 0.8,
+      at = legend_ticks,
+      labels = legend_ticks
+    )
+  )
+  
+  plot(
+    boundary,
+    add = TRUE,
+    border = "red",
+    lwd = 0.6
+  )
+  
+  title(
+    xlab = "Easting (m)",
+    ylab = "Northing (m)",
+    line = 7,
+    cex.lab = 0.8
+  )
+  
+  mtext(
+    "Suitability",
+    side = 4,
+    line = 5.2,
+    cex = 0.8,
+    las = 0
+  )
+  
+  dev.off()
+}
+
+plot_suitability_zoom(
+  r = current_crop,
+  boundary = CNP_crop,
+  title_text = "Current",
+  filename = file.path(fig_dir, "zoomed_suitability_current.png")
+)
+
+plot_suitability_zoom(
+  r = rcp45_crop,
+  boundary = CNP_crop,
+  title_text = "RCP4.5",
+  filename = file.path(fig_dir, "zoomed_suitability_rcp45.png")
+)
+
+plot_suitability_zoom(
+  r = rcp85_crop,
+  boundary = CNP_crop,
+  title_text = "RCP8.5",
+  filename = file.path(fig_dir, "zoomed_suitability_rcp85.png")
+)
+
+
+#------------------------------------------------------------------------------#
+###                         Connectivity analysis                            ###
+#------------------------------------------------------------------------------#
+
+# Reproject and crop nodes to match suitability raster.
+tf_occs <- project(tf_occs_precise, crs(current_scot)) |> crop(ROI)
+translocs <- project(translocs_raw, crs(current_scot)) |> crop(ROI)
+
+tf_occs_precise <- tf_occs
+translocs_precise <- translocs
+
+# 200 m threshold is used for local connectivity, representing maximum seed
+# dispersal distance.
+max_dist_m <- 200
+
+# Add node metadata before combining wild and translocated sites.
+tf_occs_precise$node_type   <- "wild"
+translocs_precise$node_type <- "translocated"
+
+tf_occs_precise$node_id   <- paste0("W_", seq_len(nrow(tf_occs_precise)))
+translocs_precise$node_id <- paste0("T_", seq_len(nrow(translocs_precise)))
+
+node_candidates <- rbind(tf_occs_precise, translocs_precise)
+
+# Deduplicate nodes by suitability raster cell. Wild nodes take priority if a
+# wild and translocated point fall in the same cell.
+node_candidates$cell_id <- cellFromXY(current_scot, crds(node_candidates))
+node_candidates <- node_candidates[!is.na(node_candidates$cell_id), ]
+
+node_df <- as.data.frame(node_candidates, geom = "XY") %>%
+  mutate(node_priority = if_else(node_type == "wild", 1, 2)) %>%
+  arrange(cell_id, node_priority) %>%
+  distinct(cell_id, .keep_all = TRUE)
+
+patches <- vect(node_df, geom = c("x", "y"), crs = crs(current_scot))
+
+# Mean suitability across current and future scenarios acts as a simple climate
+# stability surface.
+climate_stability <- app(c(current_scot, rcp45_scot, rcp85_scot), fun = mean)
+
+# Convert current suitability to resistance. High suitability = low resistance.
+resistance <- (1 - current_scot)^2
+resistance <- clamp(resistance, lower = 0.001, upper = 1, values = TRUE)
+resistance <- crop_mask_roi(resistance, ROI)
+
+res_raster <- raster(resistance)
+conductance <- 1 / res_raster
+
+tr <- transition(conductance, transitionFunction = mean, directions = 8)
+tr <- geoCorrection(tr, type = "c")
+
+# Habitat and climate components are weighted equally for the initial priority
+# surface. Connectivity and area are added later at patch level.
+current_std   <- scale01_raster(current_scot)
+stability_std <- scale01_raster(climate_stability)
+priority_surface <- 0.5 * current_std + 0.5 * stability_std
+
+
+#------------------------------------------------------------------------------#
+###              Candidate patch generation and summarisation                ###
+#------------------------------------------------------------------------------#
+
+# Convert the top 1% of priority raster cells into candidate polygons.
+vals <- values(priority_surface, mat = FALSE, na.rm = TRUE)
+thr <- unname(quantile(vals, probs = 0.99, na.rm = TRUE))
+
+cat("Threshold =", thr, "\n")
+print(global(priority_surface, c("min", "max", "mean"), na.rm = TRUE))
+
+high_priority <- ifel(priority_surface >= thr, 1, NA)
+n_high <- global(!is.na(high_priority), "sum", na.rm = TRUE)[1, 1]
+
+cat("Number of high-priority cells =", n_high, "\n")
+plot(high_priority, main = "High-priority cells")
+
+if (is.na(n_high) || n_high == 0) {
+  stop("No high-priority raster cells survived the relative threshold. Try lowering the quantile, e.g. 0.80 or 0.75.")
+}
+
+candidate_patches <- as.polygons(high_priority, dissolve = TRUE, na.rm = TRUE)
+candidate_patches <- candidate_patches[expanse(candidate_patches) > 0, ]
+candidate_patches$candidate_id <- paste0("C_", seq_len(nrow(candidate_patches)))
+
+if (nrow(candidate_patches) == 0) {
+  stop("High-priority cells exist, but no candidate polygons were created. Check polygon conversion and area filtering.")
+}
+
+# Extract habitat/climate summaries for each candidate patch.
+current_extract   <- terra::extract(current_std, candidate_patches, fun = mean, na.rm = TRUE)
+stability_extract <- terra::extract(stability_std, candidate_patches, fun = mean, na.rm = TRUE)
+priority_extract  <- terra::extract(priority_surface, candidate_patches, fun = mean, na.rm = TRUE)
+
+candidate_patches$mean_current_suitability <- current_extract[, 2]
+candidate_patches$mean_climate_stability   <- stability_extract[, 2]
+candidate_patches$mean_priority            <- priority_extract[, 2]
+candidate_patches$area_m2 <- expanse(candidate_patches, unit = "m")
+candidate_patches$area_ha <- candidate_patches$area_m2 / 10000
+
+# Remove candidate patches with low mean current suitability.
+candidate_patches <- candidate_patches[candidate_patches$mean_current_suitability >= 0.5, ]
+candidate_patches$candidate_id <- paste0("C_", seq_len(nrow(candidate_patches)))
+
+# Centroids are used only as representative points for distance/cost calculations.
+candidate_pts <- centroids(candidate_patches)
+
+candidate_metrics <- calculate_candidate_connectivity(
+  candidate_pts = candidate_pts,
+  candidate_patches = candidate_patches,
+  patches = patches,
+  transition_layer = tr,
+  max_dist_m = max_dist_m
+)
+
+candidate_patch_table <- as.data.frame(candidate_patches) %>%
+  left_join(candidate_metrics, by = "candidate_id")
+
+
+#------------------------------------------------------------------------------#
+###                         Candidate ranking                                ###
+#------------------------------------------------------------------------------#
+
+candidate_patch_table$current_score    <- scale01_vector(candidate_patch_table$mean_current_suitability)
+candidate_patch_table$stability_score  <- scale01_vector(candidate_patch_table$mean_climate_stability)
+candidate_patch_table$area_score       <- scale01_vector(candidate_patch_table$area_ha)
+candidate_patch_table$wild_count_score <- scale01_vector(candidate_patch_table$n_wild_200m)
+candidate_patch_table$node_count_score <- scale01_vector(candidate_patch_table$n_nodes_200m)
+
+# Lower cost to wild nodes is better, so invert the standardised cost.
+candidate_patch_table$cost_score <- ifelse(
+  is.na(candidate_patch_table$min_cost_to_wild),
+  NA_real_,
+  1 - scale01_vector(candidate_patch_table$min_cost_to_wild)
+)
+candidate_patch_table$cost_score[is.na(candidate_patch_table$cost_score)] <- 0
+
+# Final site ranking score. Weights are retained from the original analysis.
+candidate_patch_table$site_rank_score <- with(
+  candidate_patch_table,
+  0.275 * current_score +
+    0.275 * stability_score +
+    0.25 * wild_count_score +
+    0.10 * cost_score +
+    0.10 * area_score
+)
+
+candidate_patch_table <- candidate_patch_table %>%
+  arrange(desc(site_rank_score))
+
+# Rank classes are relative to the generated candidate set.
+q50 <- quantile(candidate_patch_table$site_rank_score, 0.50, na.rm = TRUE)
+q90 <- quantile(candidate_patch_table$site_rank_score, 0.90, na.rm = TRUE)
+
+candidate_patch_table <- candidate_patch_table %>%
+  mutate(
+    rank_class = case_when(
+      is.na(site_rank_score) ~ NA_character_,
+      site_rank_score >= q90 ~ "High",
+      site_rank_score < q50 ~ "Low",
+      TRUE ~ "Medium"
+    )
+  )
+
+candidate_patches <- add_rank_fields_to_patches(candidate_patches, candidate_patch_table)
+
+# Quick diagnostic plots -------------------------------------------------------
+plot(
+  candidate_patches,
+  "site_rank_score",
+  col = hcl.colors(20, "YlOrRd"),
+  main = "Candidate translocation sites ranked by importance"
+)
+points(patches, col = "blue", pch = 16, cex = 0.6)
+
+plot(priority_surface, main = "Priority surface with ranked candidate sites")
+plot(
+  candidate_patches,
+  "site_rank_score",
+  col = hcl.colors(20, "YlOrRd"),
+  add = TRUE,
+  border = "grey30",
+  lwd = 0.5
+)
+points(patches, col = "blue", pch = 16, cex = 0.5)
+
+
+#------------------------------------------------------------------------------#
+###                         Final priority figures                           ###
+#------------------------------------------------------------------------------#
+
+priority_top <- ifel(priority_surface >= thr, priority_surface, NA)
+elevation <- rast(file.path(clean_dir, "covariates/topo_preds/elevation.tif"))
+
+priority_top <- crop_mask_roi(priority_top, ROI)
+elevation <- crop_mask_roi(elevation, ROI)
+
+# Get legend ranges before cropping to the local map extent.
+elev_rng <- global(elevation, c("min", "max"), na.rm = TRUE)
+elev_lim <- c(elev_rng[1, 1], elev_rng[1, 2])
+
+prio_rng <- global(priority_top, c("min", "max"), na.rm = TRUE)
+prio_lim <- c(prio_rng[1, 1], prio_rng[1, 2])
+
+# Use all Twinflower nodes to define the final zoom extent.
+zoom_points <- node_candidates
+
+if (!same.crs(zoom_points, elevation)) zoom_points <- project(zoom_points, elevation)
+if (!same.crs(ROI, elevation)) ROI <- project(ROI, elevation)
+
+e <- ext(zoom_points)
+buffer_dist <- 10000
+
+e_crop <- ext(
+  xmin(e) - buffer_dist,
+  xmax(e) + buffer_dist,
+  ymin(e) - buffer_dist,
+  ymax(e) + buffer_dist
+)
+
+elevation_crop    <- crop(elevation, e_crop)
+priority_top_crop <- crop(priority_top, e_crop)
+ROI_crop          <- crop(ROI, e_crop)
+
+elev_cols <- viridis(100)
+prio_cols <- viridis(100, option = "inferno")
+
+options(scipen = 999)
+
+png(file.path(fig_dir, "top_priority_sites.png"), width = 2200, height = 1600, res = 300)
+
+layout(matrix(c(1, 2, 3), nrow = 1), widths = c(1.1, 4.2, 1.1))
+
+# Left legend: elevation.
+draw_vertical_legend(
+  cols = elev_cols,
+  zlim = elev_lim,
+  title = "Elevation\n(m)",
+  axis_side = 4,
+  bar_x = c(0.45, 0.65)
+)
+
+# Main map.
+par(mar = c(6, 3.5, 2.5, 1.5), mgp = c(1.8, 0.5, 0))
+
+plot(
+  elevation_crop,
+  col = elev_cols,
+  legend = FALSE,
+  axes = TRUE,
+  box = FALSE,
+  main = "Top priority areas",
+  xlab = "",
+  ylab = ""
+)
+
+plot(priority_top_crop, add = TRUE, col = prio_cols, legend = FALSE)
+plot(ROI_crop, add = TRUE, border = "black", lwd = 0.15)
+
+mtext("Easting (m)", side = 1, line = 4.85, cex = 0.6)
+mtext("Northing (m)", side = 2, line = -2, cex = 0.6)
+
+# Right legend: site priority.
+draw_vertical_legend(
+  cols = prio_cols,
+  zlim = prio_lim,
+  title = "Site priority",
+  axis_side = 2,
+  bar_x = c(0.35, 0.55)
+)
+
+dev.off()
+
+
+#------------------------------------------------------------------------------#
+###                         Write outputs                                    ###
+#------------------------------------------------------------------------------#
+
+writeRaster(
+  priority_surface,
+  file.path(connect_dir, "priority_surface_200m_sites.tif"),
+  overwrite = TRUE
+)
+
+writeVector(
+  patches,
+  file.path(connect_dir, "connectivity_nodes.shp"),
+  overwrite = TRUE
+)
+
+writeVector(
+  candidate_patches,
+  file.path(connect_dir, "candidate_translocation_patches_ranked_200m.gpkg"),
+  overwrite = TRUE
+)
+
+write.csv(
+  candidate_patch_table,
+  file.path(connect_dir, "candidate_patch_rankings_200m.csv"),
+  row.names = FALSE
+)
+
+png(file.path(connect_dir, "priority_surface_200m_sites.png"), width = 2000, height = 1600, res = 300)
+plot(priority_surface, col = hcl.colors(50, "viridis"), main = "Priority surface")
+dev.off()
+
+
+#------------------------------------------------------------------------------#
+###                         Zoomed priority surface                          ###
+#------------------------------------------------------------------------------#
+
+prio_surf <- rast(file.path(connect_dir, "priority_surface_200m_sites.tif"))
+
+if (!same.crs(tf_occs_raw, prio_surf)) tf_occs_raw <- project(tf_occs_raw, prio_surf)
+if (!same.crs(translocs_raw, prio_surf)) translocs_raw <- project(translocs_raw, prio_surf)
+
+all_pts <- rbind(tf_occs_raw, translocs_raw)
+ext_pts <- ext(all_pts)
+
+ext_zoom <- ext(
+  xmin(ext_pts) - 10000,
+  xmax(ext_pts) + 10000,
+  ymin(ext_pts) - 10000,
+  ymax(ext_pts) + 10000
+)
+
+prio_zoom <- crop(prio_surf, ext_zoom)
+
+options(scipen = 999)
+legend_ticks <- seq(0.2, 1, by = 0.2)
+
+png(file.path(fig_dir, "zoomed_prio_surface.png"), width = 3000, height = 4200, res = 600)
+
+par(mar = c(8, 8, 5, 8), cex.axis = 0.8, cex.main = 1.2)
+
+plot(
+  prio_zoom,
+  col = hcl.colors(50, "viridis"),
+  main = "Translocation priority surface",
+  xlab = "",
+  ylab = "",
+  axes = TRUE,
+  plg = list(title = "", cex = 0.8, at = legend_ticks, labels = legend_ticks)
+)
+
+title(xlab = "Easting (m)", ylab = "Northing (m)", line = 7, cex.lab = 0.8)
+mtext("Patch score", side = 4, line = 5.2, cex = 0.8, las = 0)
+
+dev.off()
