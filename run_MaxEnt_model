@@ -1,0 +1,1400 @@
+################################################################################
+###                     Script 3: Run MaxEnt model                           ###
+################################################################################
+
+# Purpose:
+#   Fit, evaluate and project a MaxEnt model for Twinflower using current and
+#   future predictor stacks. Outputs include fitted model objects, prediction
+#   rasters, suitability maps, variable-importance plots and partial-effect plots.
+
+# Load packages ----------------------------------------------------------------
+library(tidyterra)
+library(rJava)
+library(ENMeval)
+library(terra)
+library(raster)
+library(tidyverse)
+library(dismo)
+library(tidyr)
+library(ecospat)
+library(enmSdmX)
+library(viridis)
+library(maxnet)
+library(dplyr)
+library(ggplot2)
+library(ggforce)
+library(gt)
+
+# Load custom functions --------------------------------------------------------
+source("E:/Shared drives/Twinflower/Scripts/misc_functions/misc_functions.R")
+
+# Paths ------------------------------------------------------------------------
+base_dir   <- "E:/Shared drives/Twinflower"
+raw_dir    <- file.path(base_dir, "RawData")
+clean_dir  <- file.path(base_dir, "CleanData")
+out_dir    <- file.path(base_dir, "Outputs")
+temp_dir   <- file.path(base_dir, "temp")
+
+cov_dir        <- file.path(clean_dir, "covariates")
+clim_pred_dir  <- file.path(cov_dir, "clim_preds")
+simple_out_dir <- file.path(out_dir, "SimpleModelOut")
+fig_dir        <- file.path(out_dir, "final_figures")
+map_dir        <- file.path(out_dir, "Maps")
+
+roi_path <- file.path(raw_dir, "ROI_polygon/ROI.shp")
+roi_uk_path <- file.path(
+  raw_dir,
+  "ROI_polygon/bdline_essh_gb/Data/Supplementary_Country/country_region.shp"
+)
+
+# Create output directories if needed.
+dir.create(simple_out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(map_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(temp_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Load ROI files ---------------------------------------------------------------
+ROI <- vect(roi_path)
+ROI_UK <- vect(roi_uk_path)
+
+# Template raster for alignment ------------------------------------------------
+template <- rast(
+  xmin = xmin(ROI_UK),
+  xmax = xmax(ROI_UK),
+  ymin = ymin(ROI_UK),
+  ymax = ymax(ROI_UK),
+  resolution = 50,
+  crs = crs(ROI_UK)
+)
+
+# MaxEnt settings --------------------------------------------------------------
+args <- commandArgs(trailingOnly = TRUE)
+job <- if (length(args) >= 1) as.integer(args[1]) else 1
+
+n_background_choices <- c(10000)
+thin_choices <- c(100)
+seed_choices <- c(42)
+n_cores <- 2
+
+mult_combs <- crossing(n_background_choices, thin_choices, seed_choices)
+comb_values <- mult_combs[job, ]
+
+thin_dist <- comb_values$thin_choices
+seed <- comb_values$seed_choices
+n_background <- comb_values$n_background_choices
+
+set.seed(seed)
+
+# Terra settings ---------------------------------------------------------------
+terraOptions(tempdir = temp_dir, memfrac = 0.6)
+
+
+#------------------------------------------------------------------------------#
+###                         Helper functions                                ###
+#------------------------------------------------------------------------------#
+
+strip_prefix <- function(x) sub("^[^_]+_", "", x)
+
+load_raster_stack <- function(path, pattern = "\\.tif$") {
+  rast(list.files(path, pattern = pattern, full.names = TRUE))
+}
+
+save_png_map <- function(r, filename, title) {
+  
+  png(filename, width = 1800, height = 1800, res = 300)
+  
+  options(scipen = 999)
+  
+  par(
+    mar = c(7, 5.5, 4.2, 6.2),
+    mgp = c(3.2, 0.8, 0),
+    cex.axis = 0.75,
+    cex.lab = 0.9,
+    cex.main = 1.0
+  )
+  
+  plot(
+    r,
+    main = title,
+    ylab = "Northing (m)",
+    axes = TRUE,
+    box = TRUE,
+    col = hcl.colors(80, "viridis"),
+    range = c(0, 1),
+    colNA = "white",
+    plg = list(
+      title = "",
+      cex = 0.75,
+      at = seq(0, 1, by = 0.2),
+      labels = seq(0, 1, by = 0.2),
+      shrink = 0.75,
+      width = 1
+    )
+  )
+  
+  mtext(
+    "Easting (m)",
+    side = 1,
+    line = 6,
+    cex = 0.75
+  )
+  
+  mtext(
+    "Suitability",
+    side = 4,
+    line = 1.25,
+    cex = 0.85
+  )
+  
+  dev.off()
+}
+
+remove_aux_files <- function(path) {
+  file.remove(list.files(path, pattern = ".*\\.aux.*$", full.names = TRUE))
+}
+
+# Standardise CRS metadata before resampling. This protects the workflow from
+# layers with missing or unreadable CRS strings.
+fix_layer_crs <- function(layer, template, layer_name = NULL, assume_crs = NULL) {
+  
+  if (is.null(layer_name) || is.na(layer_name) || layer_name == "") {
+    layer_name <- tryCatch(names(layer)[1], error = function(e) "unknown_layer")
+    if (is.null(layer_name) || is.na(layer_name) || layer_name == "") {
+      layer_name <- "unknown_layer"
+    }
+  }
+  
+  layer_crs <- tryCatch(terra::crs(layer), error = function(e) NA_character_)
+  
+  if (is.na(layer_crs) || !nzchar(layer_crs)) {
+    if (is.null(assume_crs) || is.na(assume_crs) || !nzchar(assume_crs)) {
+      message("Skipping ", layer_name, ": missing CRS and no assume_crs provided")
+      return(NULL)
+    }
+    
+    message("Assigning missing CRS to ", layer_name)
+    ok <- tryCatch({
+      terra::crs(layer) <- assume_crs
+      TRUE
+    }, error = function(e) {
+      message("Skipping ", layer_name, ": failed to assign CRS - ", e$message)
+      FALSE
+    })
+    
+    if (!ok) return(NULL)
+  }
+  
+  crs_ok <- tryCatch({
+    terra::same.crs(layer, template)
+    TRUE
+  }, error = function(e) FALSE)
+  
+  if (!crs_ok) {
+    if (is.null(assume_crs) || is.na(assume_crs) || !nzchar(assume_crs)) {
+      message("Skipping ", layer_name, ": unreadable/broken CRS")
+      return(NULL)
+    }
+    
+    message("Replacing broken CRS for ", layer_name)
+    ok <- tryCatch({
+      terra::crs(layer) <- assume_crs
+      TRUE
+    }, error = function(e) {
+      message("Skipping ", layer_name, ": failed to replace broken CRS - ", e$message)
+      FALSE
+    })
+    
+    if (!ok) return(NULL)
+  }
+  
+  final_ok <- tryCatch({
+    x <- terra::crs(layer)
+    !is.na(x) && nzchar(x)
+  }, error = function(e) FALSE)
+  
+  if (!final_ok) {
+    message("Skipping ", layer_name, ": CRS invalid after cleanup")
+    return(NULL)
+  }
+  
+  layer
+}
+
+# Align, mask and write all predictor layers for a scenario. Existing valid
+# files are reused to avoid unnecessary reprocessing.
+resample_and_write <- function(predictors, template, ROI, outdir,
+                               categorical_layers = c("soil_type")) {
+  
+  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+  
+  all_layers <- list()
+  for (p in predictors) {
+    for (i in seq_len(nlyr(p))) {
+      all_layers[[length(all_layers) + 1]] <- p[[i]]
+    }
+  }
+  
+  out_files <- c()
+  
+  for (i in seq_along(all_layers)) {
+    layer <- all_layers[[i]]
+    layer_name <- names(layer)[1]
+    if (is.null(layer_name) || layer_name == "") layer_name <- paste0("layer_", i)
+    
+    outfile <- file.path(outdir, paste0(layer_name, ".tif"))
+    
+    if (file.exists(outfile)) {
+      valid <- TRUE
+      r <- try(terra::rast(outfile), silent = TRUE)
+      
+      if (inherits(r, "try-error")) {
+        valid <- FALSE
+      } else {
+        vals <- try(terra::global(r, "notNA", na.rm = TRUE), silent = TRUE)
+        if (inherits(vals, "try-error") || vals[1, 1] == 0) valid <- FALSE
+        rm(r)
+      }
+      
+      if (valid) {
+        message("Skipping valid existing: ", layer_name)
+        out_files <- c(out_files, outfile)
+        next
+      }
+      
+      message("Reprocessing corrupted file: ", layer_name)
+      file.remove(outfile)
+    }
+    
+    message("Processing: ", layer_name)
+    
+    method <- if (layer_name %in% categorical_layers) "near" else "bilinear"
+    datatype <- if (layer_name %in% categorical_layers) "INT2S" else "FLT4S"
+    
+    layer <- fix_layer_crs(
+      layer = layer,
+      template = template,
+      layer_name = layer_name,
+      assume_crs = terra::crs(template)
+    )
+    if (is.null(layer)) next
+    
+    if (!terra::same.crs(layer, template)) {
+      layer <- try(terra::project(layer, terra::crs(template)), silent = TRUE)
+      if (inherits(layer, "try-error")) {
+        message("Projection failed: ", layer_name)
+        next
+      }
+    }
+    
+    layer <- try(terra::resample(layer, template, method = method), silent = TRUE)
+    if (inherits(layer, "try-error")) {
+      message("Resample failed: ", layer_name)
+      next
+    }
+    
+    layer <- try(terra::mask(terra::crop(layer, ROI), ROI), silent = TRUE)
+    if (inherits(layer, "try-error")) {
+      message("Mask failed: ", layer_name)
+      next
+    }
+    
+    rng <- try(terra::global(layer, c("min", "max"), na.rm = TRUE), silent = TRUE)
+    if (inherits(rng, "try-error") || all(is.na(rng))) {
+      message("Skipping empty layer: ", layer_name)
+      next
+    }
+    
+    success <- try(
+      terra::writeRaster(
+        layer,
+        filename = outfile,
+        overwrite = TRUE,
+        wopt = list(gdal = c("COMPRESS=LZW"), datatype = datatype)
+      ),
+      silent = TRUE
+    )
+    
+    if (inherits(success, "try-error") || !file.exists(outfile)) {
+      message("Write failed: ", layer_name)
+      next
+    }
+    
+    out_files <- c(out_files, outfile)
+    rm(layer)
+    gc()
+  }
+  
+  if (length(out_files) == 0) stop("No rasters were successfully written.")
+  
+  message("Building final stack...")
+  terra::rast(out_files)
+}
+
+# Select the best ENMeval model using the same multi-criteria rules as the
+# original script: ΔAICc, omission, AUC difference, then validation AUC.
+select_best_model <- function(enmeval_object) {
+  results_tbl <- enmeval_object@results
+  cand <- results_tbl
+  
+  if ("delta.AICc" %in% names(cand) && any(!is.na(cand$delta.AICc))) {
+    cand <- cand[cand$delta.AICc <= 2, , drop = FALSE]
+    if (nrow(cand) == 0) {
+      cand <- results_tbl[which.min(results_tbl$delta.AICc), , drop = FALSE]
+    }
+  }
+  
+  if ("or.10p.avg" %in% names(cand)) {
+    min_or <- min(cand$or.10p.avg, na.rm = TRUE)
+    cand <- cand[cand$or.10p.avg == min_or, , drop = FALSE]
+  }
+  
+  if ("auc.diff.avg" %in% names(cand)) {
+    min_aucdiff <- min(cand$auc.diff.avg, na.rm = TRUE)
+    cand <- cand[cand$auc.diff.avg == min_aucdiff, , drop = FALSE]
+  }
+  
+  best_row <- if ("auc.val.avg" %in% names(cand)) {
+    cand[which.max(cand$auc.val.avg), , drop = FALSE]
+  } else {
+    cand[1, , drop = FALSE]
+  }
+  
+  best_idx <- as.integer(rownames(best_row))
+  
+  list(
+    best_idx = best_idx,
+    best_row = best_row,
+    best_model = enmeval_object@models[[best_idx]],
+    results_tbl = results_tbl
+  )
+}
+
+# Extract raw predictor names needed by a maxnet model, including predictors
+# used inside hinge/quadratic/categorical terms.
+get_raw_model_vars <- function(model) {
+  model_vars <- names(model$betas)
+  model_vars <- model_vars[model_vars != "(Intercept)"]
+  
+  unique(c(
+    model_vars[!grepl("^I\\(|^categorical\\(", model_vars)],
+    gsub("^I\\((.+)\\^2\\)$", "\\1", model_vars[grepl("^I\\(.+\\^2\\)$", model_vars)]),
+    gsub(
+      "^categorical\\((.+)\\):.*$",
+      "\\1",
+      model_vars[grepl("^categorical\\(.+\\):", model_vars)]
+    )
+  ))
+}
+
+check_vars <- function(r, vars, nm) {
+  miss <- setdiff(vars, names(r))
+  if (length(miss) > 0) {
+    stop(sprintf("Missing predictors in %s: %s", nm, paste(miss, collapse = ", ")))
+  }
+}
+
+# Prediction wrapper for terra::predict. Converts NaN to NA and only predicts
+# complete rows, preventing failures caused by missing raster cells.
+predfun_cloglog <- function(model, data) {
+  data <- as.data.frame(data)
+  
+  for (j in seq_along(data)) {
+    x <- data[[j]]
+    x[is.nan(x)] <- NA
+    data[[j]] <- x
+  }
+  
+  ok <- stats::complete.cases(data)
+  out <- rep(NA_real_, nrow(data))
+  
+  if (any(ok)) {
+    out[ok] <- as.numeric(predict(model, data[ok, , drop = FALSE], type = "cloglog"))
+  }
+  
+  out
+}
+
+plot_suitability <- function(r, title_text, legend_title = "Suitability") {
+  legend_ticks <- seq(0, 1, by = 0.2)
+  
+  par(
+    mar = c(8, 8, 5, 8),
+    cex.axis = 0.6,
+    cex.lab = 1.2,
+    bg = "white"
+  )
+  
+  plot(
+    r,
+    col = hcl.colors(50, "viridis"),
+    range = c(0, 1),
+    main = title_text,
+    axes = TRUE,
+    box = TRUE,
+    colNA = "white",
+    plg = list(title = "", cex = 0.8, at = legend_ticks, labels = legend_ticks),
+    xlab = "",
+    ylab = ""
+  )
+  
+  title(xlab = "Easting (m)", ylab = "Northing (m)", line = 7, cex.lab = 0.8)
+  mtext(legend_title, side = 4, line = 5.2, cex = 0.8)
+}
+
+plot_occupied_habitat <- function(suitability_raster, wild_pts, transloc_pts,
+                                  filename, title_text, ext_zoom,
+                                  legend_settings) {
+  raster_zoom <- crop(suitability_raster, ext_zoom)
+  
+  png(filename, width = 3000, height = 4200, res = 600)
+  
+  layout(matrix(c(1, 2), nrow = 2), heights = c(5, 1))
+  
+  par(mar = c(5, 5, 8, 7))
+  plot(
+    raster_zoom,
+    col = hcl.colors(50, "viridis"),
+    main = "",
+    axes = TRUE,
+    xlab = "Easting (m)",
+    ylab = "Northing (m)",
+    cex.lab = 0.6,
+    zlim = c(0, 1),
+    plg = legend_settings,
+    reset = FALSE
+  )
+  
+  mtext("Suitability", side = 4, line = 3, cex = 0.6)
+  title(title_text, line = 7, cex.main = 1.0, font.main = 2)
+  
+  points(wild_pts, col = adjustcolor("orange", alpha.f = 0.65), pch = 16, cex = 0.7)
+  points(transloc_pts, col = adjustcolor("red", alpha.f = 0.65), pch = 17, cex = 0.7)
+  
+  par(mar = c(0, 0, 0, 0))
+  plot.new()
+  
+  legend(
+    "top",
+    inset = c(0, 0.15),
+    legend = c("Wild occurrences", "Translocations"),
+    col = c(adjustcolor("orange", alpha.f = 0.65), adjustcolor("red", alpha.f = 0.65)),
+    pch = c(16, 17),
+    horiz = TRUE,
+    bty = "n",
+    title = "Site Type:",
+    cex = 0.6
+  )
+  
+  layout(1)
+  dev.off()
+}
+
+get_mode <- function(x) {
+  ux <- unique(x[!is.na(x)])
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+
+#------------------------------------------------------------------------------#
+###                         Load occurrence data                             ###
+#------------------------------------------------------------------------------#
+
+effort_rast <- rast("C:/Users/ts1774/temp/bias_data.tif")
+effort_rast_r <- raster(effort_rast)
+
+occs <- read.csv(file.path(clean_dir, "occurrences/tf_df.csv")) %>%
+  select(x, y)
+
+ME_occs <- occs %>%
+  vect(geom = c("x", "y"), crs = crs(ROI_UK)) %>%
+  thin_spatial(dist_meters = thin_dist, seed = seed) %>%
+  as.data.frame(geom = "XY")
+
+ME_occs_vect <- vect(ME_occs, geom = c("x", "y"), crs = crs(effort_rast))
+ME_occs_sp <- as(ME_occs_vect, "Spatial")
+
+# Background points ------------------------------------------------------------
+bg_file <- file.path(
+  clean_dir,
+  paste0("bg_bias_seed", seed, "_n", n_background, "_thin", thin_dist, ".csv")
+)
+
+if (!file.exists(bg_file)) {
+  bg_bias <- dismo::randomPoints(mask = effort_rast_r, n = n_background, prob = TRUE)
+  write.csv(bg_bias, bg_file, row.names = FALSE)
+} else {
+  cat("Loading existing background file:\n", bg_file, "\n")
+  bg_bias <- read.csv(bg_file)
+}
+
+# Reproject occurrence and background coordinates to match the template.
+occ_df <- ME_occs[, c("x", "y")]
+bg_bias <- bg_bias[, c("x", "y")]
+
+occ_df$x <- as.numeric(occ_df$x)
+occ_df$y <- as.numeric(occ_df$y)
+bg_bias$x <- as.numeric(bg_bias$x)
+bg_bias$y <- as.numeric(bg_bias$y)
+
+occ_df <- as.data.frame(
+  terra::project(vect(occ_df, geom = c("x", "y"), crs = crs(ROI_UK)), crs(template)),
+  geom = "XY"
+)[, c("x", "y")]
+
+bg_bias <- as.data.frame(
+  terra::project(vect(bg_bias, geom = c("x", "y"), crs = crs(ROI_UK)), crs(template)),
+  geom = "XY"
+)[, c("x", "y")]
+
+cat("Number of occurrence points:", nrow(occ_df), "\n")
+cat("Number of background points:", nrow(bg_bias), "\n")
+
+if (nrow(occ_df) < 10) warning("Very few occurrence points — model may be unreliable")
+if (nrow(bg_bias) < 1000) warning("Background sample size may be too small")
+
+
+#------------------------------------------------------------------------------#
+###                         Load predictor stacks                            ###
+#------------------------------------------------------------------------------#
+
+clim_stack_current <- load_raster_stack(file.path(clim_pred_dir, "current_updated"))
+clim_stack_rcp45   <- load_raster_stack(file.path(clim_pred_dir, "rcp45_updated"))
+clim_stack_rcp85   <- load_raster_stack(file.path(clim_pred_dir, "rcp85_updated"))
+soil_stack         <- load_raster_stack(file.path(cov_dir, "soil/soil_stack"))
+topo_stack         <- load_raster_stack(file.path(cov_dir, "topo_preds"))
+land_cover         <- rast(file.path(cov_dir, "land_cover/landcover_50m_proportion.tif"))
+
+# Standardise climate names across scenarios.
+names(clim_stack_current) <- strip_prefix(names(clim_stack_current))
+names(clim_stack_rcp45) <- names(clim_stack_current)
+names(clim_stack_rcp85) <- names(clim_stack_current)
+
+pred_current <- list(clim_stack_current, topo_stack, soil_stack, land_cover)
+pred_rcp45   <- list(clim_stack_rcp45, topo_stack, soil_stack, land_cover)
+pred_rcp85   <- list(clim_stack_rcp85, topo_stack, soil_stack, land_cover)
+
+cat("Soil layer names:\n")
+print(names(soil_stack))
+
+cat("Expected categorical variables:\n")
+print(c("soil_type"))
+
+if (!any(grepl("soil", names(soil_stack), ignore.case = TRUE))) {
+  warning("No soil-related layer detected — categorical treatment may be incorrect")
+}
+
+ROI_UK <- terra::project(ROI_UK, template)
+ROI_UK <- terra::makeValid(ROI_UK)
+
+# Write aligned and resampled raster stacks for each scenario ------------------
+resampled_stack_current <- resample_and_write(
+  pred_current,
+  template,
+  ROI_UK,
+  file.path(temp_dir, "predictors_current")
+)
+
+resampled_stack_rcp45 <- resample_and_write(
+  pred_rcp45,
+  template,
+  ROI_UK,
+  file.path(temp_dir, "predictors_rcp45")
+)
+
+resampled_stack_rcp85 <- resample_and_write(
+  pred_rcp85,
+  template,
+  ROI_UK,
+  file.path(temp_dir, "predictors_rcp85")
+)
+
+# Free memory and reload rasters from disk.
+rm(pred_current, pred_rcp45, pred_rcp85)
+gc()
+
+resampled_stack_current <- load_raster_stack(file.path(temp_dir, "predictors_current"))
+resampled_stack_rcp45   <- load_raster_stack(file.path(temp_dir, "predictors_rcp45"))
+resampled_stack_rcp85   <- load_raster_stack(file.path(temp_dir, "predictors_rcp85"))
+
+remove_aux_files(file.path(temp_dir, "predictors_current"))
+remove_aux_files(file.path(temp_dir, "predictors_rcp45"))
+remove_aux_files(file.path(temp_dir, "predictors_rcp85"))
+
+
+#------------------------------------------------------------------------------#
+###                         Model tuning and selection                       ###
+#------------------------------------------------------------------------------#
+
+terra::terraOptions(
+  memfrac = 0.6,
+  memmax = 20,
+  tempdir = "C:/Users/ts1774/temp",
+  progress = 1
+)
+
+# Build 250 m tuning stack. Continuous layers are averaged; the categorical soil
+# layer uses the modal class.
+cont_names <- names(resampled_stack_current)[names(resampled_stack_current) != "soil_type"]
+
+env_cont_tune <- terra::aggregate(
+  resampled_stack_current[[cont_names]],
+  fact = 5,
+  fun = mean
+)
+
+soil_tune <- terra::aggregate(
+  resampled_stack_current[["soil_type"]],
+  fact = 5,
+  fun = modal
+)
+
+soil_tune <- terra::as.factor(soil_tune)
+soil_tune <- terra::droplevels(soil_tune)
+
+print(terra::levels(soil_tune))
+print(terra::freq(soil_tune))
+
+resampled_stack_current_tune <- c(env_cont_tune, soil_tune)
+names(resampled_stack_current_tune)[nlyr(resampled_stack_current_tune)] <- "soil_type"
+
+# Run MaxEnt model tuning ------------------------------------------------------
+e.mx_current <- ENMevaluate(
+  occs = occ_df,
+  bg = bg_bias,
+  env = resampled_stack_current_tune,
+  algorithm = "maxnet",
+  categoricals = c("soil_type"),
+  partitions = "randomkfold",
+  partition.settings = list(kfolds = 5),
+  tune.args = list(
+    fc = c("L", "LQ", "LQH"),
+    rm = seq(1, 4, 1)
+  ),
+  raster.preds = FALSE,
+  parallel = FALSE,
+  numCores = n_cores
+)
+
+model_rds <- file.path(simple_out_dir, "ENMeval_results_50m.rds")
+saveRDS(e.mx_current, model_rds)
+
+class(e.mx_current)
+colnames(e.mx_current@results)
+
+# Multi-criteria model selection ----------------------------------------------
+e.mx_current <- readRDS(model_rds)
+results_tbl <- e.mx_current@results
+print(colnames(results_tbl))
+
+selection <- select_best_model(e.mx_current)
+best_idx <- selection$best_idx
+best_row <- selection$best_row
+best <- selection$best_model
+
+cat("Selected settings:\n")
+print(best_row[, intersect(
+  c("fc", "rm", "auc.val.avg", "auc.diff.avg", "or.10p.avg", "AICc", "delta.AICc"),
+  names(best_row)
+)])
+
+# Model evaluation table -------------------------------------------------------
+model_eval_tbl <- results_tbl %>%
+  mutate(
+    Model = row_number(),
+    Selected = if_else(Model == best_idx, "Selected model", "")
+  ) %>%
+  select(
+    Model,
+    Selected,
+    `Feature classes (FC)` = fc,
+    `Regularisation multiplier (RM)` = rm,
+    `Mean validation AUC` = auc.val.avg,
+    `AUC difference (train - test)` = auc.diff.avg,
+    `Omission rate (10th percentile)` = or.10p.avg,
+    `AICc score` = AICc,
+    `ΔAICc` = delta.AICc
+  ) %>%
+  slice_min(`ΔAICc`, n = 10, with_ties = FALSE) %>%
+  arrange(`ΔAICc`, `Omission rate (10th percentile)`, `AUC difference (train - test)`)
+
+model_eval_gt <- model_eval_tbl %>%
+  gt() %>%
+  tab_header(
+    title = "MaxEnt model evaluation metrics",
+    subtitle = "Best model and high-scoring alternatives"
+  ) %>%
+  fmt_number(
+    columns = c(
+      `Mean validation AUC`,
+      `AUC difference (train - test)`,
+      `Omission rate (10th percentile)`,
+      `AICc score`,
+      `ΔAICc`
+    ),
+    decimals = 3
+  ) %>%
+  tab_style(
+    style = cell_fill(color = "#D9EAD3"),
+    locations = cells_body(rows = Selected == "Selected model")
+  )
+
+model_eval_gt
+gtsave(model_eval_gt, file.path(fig_dir, "model_evaluation_table.png"))
+
+# Check variable name alignment ------------------------------------------------
+cat("Raster variable names:\n")
+print(names(resampled_stack_current))
+
+model_vars <- names(best$betas)
+model_vars <- model_vars[model_vars != "(Intercept)"]
+
+cat("Model variables:\n")
+print(model_vars)
+
+missing_in_raster <- setdiff(model_vars, names(resampled_stack_current))
+extra_in_raster <- setdiff(names(resampled_stack_current), model_vars)
+
+if (length(missing_in_raster) > 0) {
+  warning("Variables in model missing from raster stack: ", paste(missing_in_raster, collapse = ", "))
+}
+
+if (length(extra_in_raster) > 0) {
+  message("Extra raster variables not used in model (OK): ", paste(extra_in_raster, collapse = ", "))
+}
+
+# Subset scenario stacks to variables needed by the selected model -------------
+vars <- get_raw_model_vars(best)
+
+cat("Raw predictors required by model:\n")
+print(vars)
+
+check_vars(resampled_stack_current, vars, "current")
+check_vars(resampled_stack_rcp45, vars, "rcp45")
+check_vars(resampled_stack_rcp85, vars, "rcp85")
+
+pred_current_subset <- resampled_stack_current[[vars]]
+pred_rcp45_subset   <- resampled_stack_rcp45[[vars]]
+pred_rcp85_subset   <- resampled_stack_rcp85[[vars]]
+
+stopifnot(compareGeom(pred_current_subset, pred_rcp45_subset, stopOnError = FALSE))
+stopifnot(compareGeom(pred_current_subset, pred_rcp85_subset, stopOnError = FALSE))
+
+cat("Current subset:\n")
+print(pred_current_subset)
+
+
+#------------------------------------------------------------------------------#
+###                         Scenario predictions                             ###
+#------------------------------------------------------------------------------#
+
+dir.create("C:/terra_tmp", showWarnings = FALSE, recursive = TRUE)
+terraOptions(tempdir = "C:/terra_tmp", progress = 1, memfrac = 0.6)
+
+# Small test before full raster prediction.
+d_test <- as.data.frame(spatSample(pred_current_subset, size = 1000, method = "regular"))
+test_pred <- predfun_cloglog(best, d_test)
+
+cat("Test predictions summary:\n")
+print(summary(test_pred))
+
+pred_map_current <- terra::predict(
+  pred_current_subset,
+  best,
+  fun = predfun_cloglog,
+  filename = file.path(map_dir, "pred_map_current.tif"),
+  overwrite = TRUE,
+  wopt = list(gdal = c("COMPRESS=LZW")),
+  na.rm = FALSE
+)
+
+pred_map_rcp45 <- terra::predict(
+  pred_rcp45_subset,
+  best,
+  fun = predfun_cloglog,
+  filename = file.path(map_dir, "pred_map_rcp45.tif"),
+  overwrite = TRUE,
+  wopt = list(gdal = c("COMPRESS=LZW")),
+  na.rm = FALSE
+)
+
+pred_map_rcp85 <- terra::predict(
+  pred_rcp85_subset,
+  best,
+  fun = predfun_cloglog,
+  filename = file.path(map_dir, "pred_map_rcp85.tif"),
+  overwrite = TRUE,
+  wopt = list(gdal = c("COMPRESS=LZW")),
+  na.rm = FALSE
+)
+
+# Reload, plot and save quick UK maps -----------------------------------------
+pred_map_current <- rast(file.path(map_dir, "pred_map_current.tif"))
+pred_map_rcp45   <- rast(file.path(map_dir, "pred_map_rcp45.tif"))
+pred_map_rcp85   <- rast(file.path(map_dir, "pred_map_rcp85.tif"))
+
+plot(pred_map_current, main = "Suitability Current")
+plot(pred_map_rcp45, main = "Suitability RCP4.5")
+plot(pred_map_rcp85, main = "Suitability RCP8.5")
+
+save_png_map(pred_map_current, file.path(fig_dir, "hs_current_UK.png"), "Current suitability")
+save_png_map(pred_map_rcp45, file.path(fig_dir, "hs_rcp45_UK.png"), "RCP4.5 suitability")
+save_png_map(pred_map_rcp85, file.path(fig_dir, "hs_rcp85_UK.png"), "RCP8.5 suitability")
+
+cat("Current map range:\n")
+print(global(pred_map_current, c("min", "max"), na.rm = TRUE))
+cat("RCP4.5 map range:\n")
+print(global(pred_map_rcp45, c("min", "max"), na.rm = TRUE))
+cat("RCP8.5 map range:\n")
+print(global(pred_map_rcp85, c("min", "max"), na.rm = TRUE))
+
+# Crop predictions to Scotland -------------------------------------------------
+pred_current_scot <- crop(pred_map_current, ROI) |> mask(ROI)
+pred_rcp45_scot   <- crop(pred_map_rcp45, ROI) |> mask(ROI)
+pred_rcp85_scot   <- crop(pred_map_rcp85, ROI) |> mask(ROI)
+
+writeRaster(pred_current_scot, file.path(simple_out_dir, "hs_current_scotland.tif"), overwrite = TRUE)
+writeRaster(pred_rcp45_scot, file.path(simple_out_dir, "hs_rcp45_scotland.tif"), overwrite = TRUE)
+writeRaster(pred_rcp85_scot, file.path(simple_out_dir, "hs_rcp85_scotland.tif"), overwrite = TRUE)
+
+pred_current_scot <- rast(file.path(simple_out_dir, "hs_current_scotland.tif"))
+pred_rcp45_scot   <- rast(file.path(simple_out_dir, "hs_rcp45_scotland.tif"))
+pred_rcp85_scot   <- rast(file.path(simple_out_dir, "hs_rcp85_scotland.tif"))
+
+# Plot Scotland-only suitability maps -----------------------------------------
+options(scipen = 999)
+
+png(file.path(fig_dir, "hs_current_scotland.png"), width = 3000, height = 4200, res = 600)
+plot_suitability(pred_current_scot, "Current suitability")
+dev.off()
+
+png(file.path(fig_dir, "hs_rcp45_scotland.png"), width = 3000, height = 4200, res = 600)
+plot_suitability(pred_rcp45_scot, "RCP4.5 suitability")
+dev.off()
+
+png(file.path(fig_dir, "hs_rcp85_scotland.png"), width = 3000, height = 4200, res = 600)
+plot_suitability(pred_rcp85_scot, "RCP8.5 suitability")
+dev.off()
+
+
+#------------------------------------------------------------------------------#
+###                 Occupied habitat over suitability maps                   ###
+#------------------------------------------------------------------------------#
+
+tf_occs_raw <- vect(file.path(raw_dir, "Tf_occ_data/Shapefiles/TF_Scot_nodupl.shp"))
+translocs_raw <- vect(file.path(
+  raw_dir,
+  "Tf_occ_data/translocations/TwinflowerTranslocationSites2025.shp"
+))
+
+all_pts <- rbind(tf_occs_raw, translocs_raw)
+ext_pts <- ext(all_pts)
+
+# Add a buffer so plotted points are not on the map edge.
+ext_zoom <- ext(
+  xmin(ext_pts) - 10000,
+  xmax(ext_pts) + 10000,
+  ymin(ext_pts) - 10000,
+  ymax(ext_pts) + 10000
+)
+
+legend_ticks <- seq(0.2, 1, by = 0.2)
+legend_settings <- list(
+  title = "",
+  at = legend_ticks,
+  labels = legend_ticks,
+  cex = 0.8,
+  shrink = 1,
+  width = 1.2
+)
+
+plot_occupied_habitat(
+  suitability_raster = pred_current_scot,
+  wild_pts = tf_occs_raw,
+  transloc_pts = translocs_raw,
+  filename = file.path(fig_dir, "occupied_habitat_current.png"),
+  title_text = "Current Occupation of Suitable Habitat",
+  ext_zoom = ext_zoom,
+  legend_settings = legend_settings
+)
+
+plot_occupied_habitat(
+  suitability_raster = pred_rcp85_scot,
+  wild_pts = tf_occs_raw,
+  transloc_pts = translocs_raw,
+  filename = file.path(fig_dir, "occupied_habitat_rcp85.png"),
+  title_text = "Occupation of Suitable Habitat (RCP8.5)",
+  ext_zoom = ext_zoom,
+  legend_settings = legend_settings
+)
+
+# Extract mean suitability scores for occupied habitat -------------------------
+suit_stack <- c(pred_current_scot, pred_rcp45_scot, pred_rcp85_scot)
+names(suit_stack) <- c("current", "rcp45", "rcp85")
+
+tf_vals <- terra::extract(suit_stack, tf_occs_raw)
+tr_vals <- terra::extract(suit_stack, translocs_raw)
+
+colMeans(tf_vals[, c("current", "rcp45", "rcp85")], na.rm = TRUE)
+colMeans(tr_vals[, c("current", "rcp45", "rcp85")], na.rm = TRUE)
+
+
+#------------------------------------------------------------------------------#
+###                         Variable importance                              ###
+#------------------------------------------------------------------------------#
+
+model_out <- readRDS(model_rds)
+slotNames(model_out)
+
+predictor_data <- rbind(model_out@occs, model_out@bg)
+predictor_data <- predictor_data[, !(names(predictor_data) %in% c("x", "y", "lon", "lat"))]
+
+best_model <- best
+baseline <- predict(best_model, predictor_data, type = "cloglog")
+
+# Permutation importance: shuffle one predictor at a time and measure the loss
+# of agreement with baseline predictions.
+vars <- colnames(predictor_data)
+
+perm_importance <- sapply(vars, function(v) {
+  perm_data <- predictor_data
+  perm_data[[v]] <- sample(perm_data[[v]])
+  perm_pred <- predict(best_model, perm_data, type = "cloglog")
+  1 - cor(baseline, perm_pred)
+})
+
+vi_best <- data.frame(
+  variable = vars,
+  permutation.importance = perm_importance
+) %>%
+  arrange(desc(permutation.importance))
+
+# Nicer names for plotting.
+figure_names <- c(
+  acid_grassland_prop = "Acid grassland (%)",
+  arable_prop = "Arable land (%)",
+  bog_prop = "Bog (%)",
+  calcareous_grassland_prop = "Calcareous grassland (%)",
+  coniferous_woodland_prop = "Coniferous woodland (%)",
+  deciduous_woodland_prop = "Deciduous woodland (%)",
+  duration_09perc = "Dryspell duration",
+  eastness = "Eastness",
+  elevation = "Elevation (m)",
+  fen_prop = "Fen (%)",
+  freshwater_prop = "Freshwater (%)",
+  heather_grassland_prop = "Heather grassland (%)",
+  heather_prop = "Heather (%)",
+  improved_grassland_prop = "Improved grassland (%)",
+  inland_rock_prop = "Inland rock (%)",
+  littoral_rock_prop = "Littoral rock (%)",
+  littoral_sediment_prop = "Littoral sediment (%)",
+  mean_temp = "Mean temperature (°C)",
+  neutral_grassland_prop = "Neutral grassland (%)",
+  northness = "Northness",
+  saltmarsh_prop = "Saltmarsh (%)",
+  saltwater_prop = "Saltwater (%)",
+  sd_temp = "SD temperature",
+  seasonality = "Seasonality",
+  slope = "Slope (°)",
+  soil_pH = "Soil pH",
+  supralittoral_rock_prop = "Supralittoral rock (%)",
+  supralittoral_sediment_prop = "Supralittoral sediment (%)",
+  temp_coldest = "Temp coldest 1/4",
+  temp_hottest = "Temp hottest 1/4",
+  total_rain_coldest = "Rainfall coldest 1/4",
+  total_rain_hottest = "Rainfall hottest 1/4",
+  tpi_large = "TPI large",
+  tpi_medium = "TPI medium",
+  tpi_small = "TPI small",
+  tri = "TRI",
+  urban_prop = "Urban (%)",
+  soil_type = "Soil type"
+)
+
+vi_best_nonzero <- vi_best[vi_best$permutation.importance > 1e-4, ]
+
+vi_plot <- ggplot(
+  vi_best_nonzero,
+  aes(x = reorder(variable, permutation.importance), y = permutation.importance)
+) +
+  scale_x_discrete(labels = function(x) stringr::str_wrap(figure_names[x], 25)) +
+  scale_y_continuous(limits = c(0, 0.7), breaks = seq(0, 0.7, by = 0.1)) +
+  geom_col(fill = "#2C7FB8") +
+  coord_flip() +
+  labs(
+    x = "Predictor Variable",
+    y = "Permutation Importance",
+    title = "MaxEnt Variable Importance (Best Model)"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(size = 18, face = "bold"),
+    axis.text.y = element_text(size = 12)
+  )
+
+print(vi_plot)
+
+ggsave(
+  filename = file.path(fig_dir, "maxent_variable_importance.png"),
+  plot = vi_plot,
+  width = 10,
+  height = 8,
+  dpi = 300
+)
+
+
+#------------------------------------------------------------------------------#
+###                    Partial-effect plots for predictors                   ###
+#------------------------------------------------------------------------------#
+
+best_model <- best
+pred_names <- names(resampled_stack_current)
+
+label_lookup <- function(x) {
+  out <- figure_names[x]
+  out[is.na(out)] <- x[is.na(out)]
+  unname(out)
+}
+
+set.seed(42)
+pred_sample <- terra::spatSample(
+  resampled_stack_current,
+  size = 5000,
+  method = "random",
+  na.rm = TRUE,
+  as.df = TRUE
+)
+
+# Soil-type lookup table. Indices are matched to the raster class codes below.
+soil_lut <- c(
+  "HEAVY TO MEDIUM",
+  "ALL",
+  "HEAVY",
+  "HEAVY TO MEDIUM TO LIGHT(SILTY)",
+  "HEAVY TO MEDIUM(SANDY) TO LIGHT(SANDY)",
+  "LIGHT",
+  "MEDIUM TO LIGHT(SILTY)",
+  "MEDIUM TO LIGHT(SILTY) TO HEAVY",
+  "LIGHT(SANDY) TO MEDIUM(SANDY)",
+  "MEDIUM(SILTY)",
+  "MEDIUM(SILTY) TO HEAVY",
+  "MEDIUM(SILTY) TO LIGHT(SILTY)",
+  "LIGHT(SILTY) TO MEDIUM(SILTY)",
+  "LIGHT(SILTY) TO MEDIUM(SILTY) TO HEAVY",
+  "MEDIUM",
+  "MEDIUM TO HEAVY",
+  "MEDIUM TO LIGHT",
+  "LIGHT(SANDY)",
+  "LIGHT TO MEDIUM",
+  "MEDIUM(SILTY) TO LIGHT(SILTY) TO HEAVY",
+  "HEAVY AND MEDIUM",
+  "LIGHT(SANDY) TO MEDIUM(SANDY) TO HEAVY",
+  "LIGHT(SILTY)"
+)
+
+if ("soil_type" %in% names(pred_sample)) {
+  pred_sample$soil_type <- factor(pred_sample$soil_type)
+}
+
+# Reference row: numeric predictors at the median, categorical predictors at the
+# modal class. Each partial-effect plot varies one predictor while holding the
+# others at these reference values.
+reference_row <- lapply(pred_sample[, pred_names, drop = FALSE], function(x) {
+  if (is.factor(x)) {
+    get_mode(x)
+  } else if (is.numeric(x)) {
+    median(x, na.rm = TRUE)
+  } else {
+    get_mode(x)
+  }
+})
+reference_row <- as.data.frame(reference_row)
+
+if ("soil_type" %in% names(reference_row)) {
+  reference_row$soil_type <- factor(
+    reference_row$soil_type,
+    levels = levels(pred_sample$soil_type)
+  )
+}
+
+partial_dir <- file.path(simple_out_dir, "partial_effects")
+dir.create(partial_dir, showWarnings = FALSE, recursive = TRUE)
+
+plot_partial_effect <- function(model, predictor_name, env_sample, reference_row,
+                                n = 100, type = "cloglog") {
+  x <- env_sample[[predictor_name]]
+  
+  grid_vals <- if (is.numeric(x)) {
+    seq(min(x, na.rm = TRUE), max(x, na.rm = TRUE), length.out = n)
+  } else {
+    sort(unique(x[!is.na(x)]))
+  }
+  
+  newdata <- reference_row[rep(1, length(grid_vals)), , drop = FALSE]
+  newdata[[predictor_name]] <- grid_vals
+  
+  if (predictor_name == "soil_type") {
+    newdata[[predictor_name]] <- factor(
+      newdata[[predictor_name]],
+      levels = levels(env_sample[[predictor_name]])
+    )
+  }
+  
+  preds <- predict(model, newdata = newdata, type = type)
+  
+  out <- data.frame(
+    predictor = predictor_name,
+    predictor_label = label_lookup(predictor_name),
+    x = grid_vals,
+    y = preds
+  )
+  
+  p <- ggplot(out, aes(x = x, y = y)) +
+    geom_line(linewidth = 1.1, colour = "#2C3E50") +
+    labs(
+      x = label_lookup(predictor_name),
+      y = "Predicted suitability",
+      title = paste("Partial effect:", label_lookup(predictor_name))
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      axis.title = element_text(face = "bold")
+    )
+  
+  list(data = out, plot = p)
+}
+
+plot_partial_categorical <- function(model, predictor_name, env_sample, reference_row,
+                                     type = "cloglog") {
+  levs <- levels(droplevels(env_sample[[predictor_name]]))
+  
+  newdata <- reference_row[rep(1, length(levs)), , drop = FALSE]
+  newdata[[predictor_name]] <- factor(levs, levels = levs)
+  
+  if ("soil_type" %in% names(newdata)) {
+    newdata$soil_type <- factor(newdata$soil_type, levels = levs)
+  }
+  
+  preds <- predict(model, newdata = newdata, type = type)
+  
+  out <- data.frame(
+    predictor = predictor_name,
+    predictor_label = label_lookup(predictor_name),
+    x = factor(levs, levels = levs),
+    y = preds
+  )
+  
+  if (predictor_name == "soil_type") {
+    soil_ids <- as.numeric(as.character(levs))
+    soil_labels_used <- soil_lut[soil_ids + 1]
+    out$x <- factor(soil_labels_used, levels = soil_labels_used)
+  } else {
+    out$x <- factor(out$x, levels = sort(unique(levs)))
+  }
+  
+  p <- ggplot(out, aes(x = x, y = y)) +
+    geom_col(fill = "#5F5F5F", width = 0.85) +
+    scale_y_continuous(limits = c(0, 0.08), breaks = seq(0, 0.08, by = 0.01)) +
+    labs(
+      x = label_lookup(predictor_name),
+      y = "Predicted suitability",
+      title = paste("Partial effects of", label_lookup(predictor_name))
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      axis.title = element_text(face = "bold"),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+      axis.text.y = element_text(size = 8)
+    )
+  
+  list(data = out, plot = p)
+}
+
+# Make and save a partial-effect plot for each predictor.
+partial_results <- lapply(pred_names, function(v) {
+  if (v == "soil_type") {
+    plot_partial_categorical(best_model, v, pred_sample, reference_row, type = "cloglog")
+  } else {
+    plot_partial_effect(best_model, v, pred_sample, reference_row, n = 100, type = "cloglog")
+  }
+})
+names(partial_results) <- pred_names
+
+for (v in pred_names) {
+  ggsave(
+    filename = file.path(partial_dir, paste0("partial_", v, ".png")),
+    plot = partial_results[[v]]$plot,
+    width = 7,
+    height = 5,
+    dpi = 300
+  )
+}
+
+partial_df <- do.call(rbind, lapply(partial_results, `[[`, "data"))
+partial_df_cont <- partial_df[partial_df$predictor != "soil_type", ]
+partial_df_cont$x <- as.numeric(as.character(partial_df_cont$x))
+
+# Combined continuous partial-effect plots in groups of nine.
+cont_predictors <- unique(partial_df_cont$predictor)
+cont_groups <- split(cont_predictors, ceiling(seq_along(cont_predictors) / 9))
+
+for (i in seq_along(cont_groups)) {
+  this_group <- cont_groups[[i]]
+  plot_df <- partial_df_cont[partial_df_cont$predictor %in% this_group, ]
+  
+  plot_df$predictor_label <- factor(
+    plot_df$predictor_label,
+    levels = label_lookup(this_group)
+  )
+  
+  p_group <- ggplot(plot_df, aes(x = x, y = y, group = 1)) +
+    geom_line(linewidth = 1.1, colour = "#2C3E50") +
+    facet_wrap(~ predictor_label, scales = "free", ncol = 3) +
+    labs(x = "Predictor value", y = "Predicted suitability") +
+    theme_classic(base_size = 14) +
+    theme(
+      strip.text = element_text(face = "bold", size = 11),
+      axis.title = element_text(face = "bold"),
+      panel.spacing = unit(0.8, "lines")
+    )
+  
+  print(p_group)
+  
+  ggsave(
+    filename = file.path(partial_dir, paste0("partial_effects_continuous_group_", i, ".png")),
+    plot = p_group,
+    width = 12,
+    height = 10,
+    dpi = 300
+  )
+}
+
+# Classify continuous partial effects as informative or flat. This keeps the
+# final figure pages readable when many predictors have near-flat responses.
+effect_strength <- aggregate(
+  y ~ predictor,
+  data = partial_df_cont,
+  FUN = function(x) {
+    diffs <- diff(x)
+    max_change <- max(abs(diffs), na.rm = TRUE)
+    total_range <- max(x, na.rm = TRUE) - min(x, na.rm = TRUE)
+    c(max_slope = max_change, range = total_range)
+  }
+)
+
+effect_strength <- do.call(data.frame, effect_strength)
+names(effect_strength) <- c("predictor", "max_change", "range")
+
+change_threshold <- 0.002
+range_threshold <- 0.002
+
+effect_strength$response_type <- ifelse(
+  effect_strength$max_change > change_threshold | effect_strength$range > range_threshold,
+  "informative",
+  "flat"
+)
+
+write.csv(
+  effect_strength[order(effect_strength$range, decreasing = TRUE), ],
+  file.path(partial_dir, "partial_effect_strength_classification.csv"),
+  row.names = FALSE
+)
+
+informative_predictors <- effect_strength$predictor[effect_strength$response_type == "informative"]
+flat_predictors <- effect_strength$predictor[effect_strength$response_type == "flat"]
+
+# Paginated plotting helper for informative/flat continuous predictors.
+plot_paginated_partial_effects <- function(predictors, partial_df_cont, label_fun,
+                                           filename_prefix, colour, free_scales = "free") {
+  if (length(predictors) == 0) return(invisible(NULL))
+  
+  ncol_fixed <- 3
+  nrow_fixed <- 3
+  n_pages <- ceiling(length(predictors) / (ncol_fixed * nrow_fixed))
+  
+  for (i in seq_len(n_pages)) {
+    plot_df <- partial_df_cont[partial_df_cont$predictor %in% predictors, ]
+    plot_df$predictor_label <- factor(plot_df$predictor_label, levels = label_fun(predictors))
+    
+    p <- ggplot(plot_df, aes(x = x, y = y, group = 1)) +
+      geom_line(linewidth = 1.1, colour = colour) +
+      ggforce::facet_wrap_paginate(
+        ~ predictor_label,
+        ncol = ncol_fixed,
+        nrow = nrow_fixed,
+        page = i,
+        scales = free_scales
+      ) +
+      labs(x = "Predictor value", y = "Predicted suitability") +
+      theme_classic(base_size = 14) +
+      theme(
+        strip.text = element_text(face = "bold", size = 11),
+        axis.title = element_text(face = "bold"),
+        panel.spacing = unit(0.8, "lines"),
+        aspect.ratio = 1
+      )
+    
+    if (filename_prefix == "partial_effects_flat_page_") {
+      p <- p + scale_y_continuous(limits = range(partial_df_cont$y, na.rm = TRUE))
+    }
+    
+    print(p)
+    
+    ggsave(
+      filename = file.path(partial_dir, paste0(filename_prefix, i, ".png")),
+      plot = p,
+      width = 12,
+      height = 12,
+      dpi = 300
+    )
+  }
+}
+
+plot_paginated_partial_effects(
+  predictors = informative_predictors,
+  partial_df_cont = partial_df_cont,
+  label_fun = label_lookup,
+  filename_prefix = "partial_effects_informative_page_",
+  colour = "#2C3E50",
+  free_scales = "free"
+)
+
+plot_paginated_partial_effects(
+  predictors = flat_predictors,
+  partial_df_cont = partial_df_cont,
+  label_fun = label_lookup,
+  filename_prefix = "partial_effects_flat_page_",
+  colour = "grey45",
+  free_scales = "free_x"
+)
+
+if ("soil_type" %in% names(partial_results)) {
+  ggsave(
+    filename = file.path(partial_dir, "partial_effect_soil_type.png"),
+    plot = partial_results[["soil_type"]]$plot,
+    width = 10,
+    height = 8,
+    dpi = 600
+  )
+}
+
+# Copy final partial-effect figures to clean final_figures folder --------------
+info_files <- list.files(
+  partial_dir,
+  pattern = "partial_effects_informative_page_.*\\.png$",
+  full.names = TRUE
+)
+file.copy(from = info_files, to = fig_dir, overwrite = TRUE)
+
+flat_files <- list.files(
+  partial_dir,
+  pattern = "partial_effects_flat_page_.*\\.png$",
+  full.names = TRUE
+)
+file.copy(from = flat_files, to = fig_dir, overwrite = TRUE)
+
+soil_file <- file.path(partial_dir, "partial_effect_soil_type.png")
+if (file.exists(soil_file)) {
+  file.copy(from = soil_file, to = fig_dir, overwrite = TRUE)
+}
