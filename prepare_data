@@ -1,0 +1,317 @@
+################################################################################
+###                Script 1: Load and Process Occurrence Data                ###
+################################################################################
+
+# Purpose:
+#   Load, clean and spatially process Twinflower occurrence records for use in
+#   MaxEnt modelling. This script defines the Scotland ROI, filters occurrence
+#   records by spatial precision, creates thinned occurrence datasets, generates
+#   a sampling-effort bias raster, and produces a validation/context map.
+
+# 1. Load required packages ----------------------------------------------------
+# Consolidating libraries (dplyr is part of tidyverse)
+library(terra)
+library(sf)
+library(tidyverse)
+library(tidyterra)
+library(lubridate)
+library(geosphere)
+library(readxl)
+
+# Load custom functions
+source('E:/Shared drives/Twinflower/Scripts/misc_functions/misc_functions.R')
+
+# 2. Define Region of Interest (ROI) -------------------------------------------
+# Load UK country boundaries and filter for Scotland
+roi_path <- "E:/Shared drives/Twinflower/RawData/ROI_polygon/"
+uk_countries <- vect(paste0(roi_path, "bdline_essh_gb/Data/Supplementary_Country/country_region.shp"))
+
+# Filter to Scotland and ensure internal consistency
+roi_scot <- uk_countries[uk_countries$NAME == "Scotland", ]
+
+# Save processed ROI for future scripts to ensure CRS and extent consistency
+writeVector(roi_scot, paste0(roi_path, "ROI.shp"), filetype = "ESRI Shapefile", overwrite = TRUE)
+
+# Reload standardized ROI
+roi <- vect(paste0(roi_path, "ROI.shp"))
+
+# 3. Process Occurrence Data ---------------------------------------------------
+# Load presence data
+occ_raw <- read.csv("E:/Shared drives/Twinflower/RawData/Tf_occ_data/TF_occ_data.csv")
+
+# Filter by precision: keep only records <= 30m to match environmental resolution
+occ_clean <- occ_raw %>%
+  filter(!is.na(precision_m), precision_m <= 30)
+
+# Convert to SpatVector, project to British National Grid, and crop to Scotland
+tf_vect <- vect(occ_clean, geom = c("easting", "northing"), crs = "epsg:27700") %>%
+  terra::project(crs(roi)) %>%
+  terra::crop(roi)
+
+# Export clean occurrences for MaxEnt (DataFrame format)
+tf_df <- as.data.frame(tf_vect, geom = "XY")
+write.csv(tf_df, "E:/Shared drives/Twinflower/CleanData/occurrences/tf_df.csv", row.names = FALSE)
+
+# 4. Spatial Thinning ----------------------------------------------------------
+# Reduce sampling bias by thinning points (100m distance threshold)
+tf_thinned <- group_thin_spatial(
+  tf_vect, 
+  group_var = "rec_year", 
+  dist_meters = 100, 
+  crs_spec = roi
+) %>%
+  dplyr::select(placename, x, y, precision_m, rec_year)
+
+# Convert thinned data back to SpatVector for plotting
+tf_thinned_vect <- vect(tf_thinned, geom = c("x", "y"), crs = crs(tf_vect))
+
+# Save thinned data
+write.csv(tf_thinned, "E:/Shared drives/Twinflower/CleanData/occs_thinned_precise.csv", row.names = FALSE)
+
+# 5. Create Bias Raster (Sampling Effort) --------------------------------------
+# Create a 50m template raster based on ROI
+template_50m <- rast(roi, resolution = 50)
+
+# Aggregate to 500m (fact=10) to calculate neighborhood density (sampling bias)
+r_coarse <- aggregate(template_50m, fact = 10)
+
+# Rasterize occurrences: count number of points per 500m cell
+bias_raster <- rasterize(tf_vect, r_coarse, fun = "sum", background = 0)
+
+# 6. Apply Gaussian Smoothing --------------------------------------------------
+# This spreads the 'influence' of a point to account for nearby sampling effort
+sigma_meters <- 20000
+sigma_cells  <- sigma_meters / res(r_coarse)[1]
+
+# Define Gaussian kernel size
+size <- (sigma_cells * 1.5)
+if (size %% 2 == 0) size <- size + 1
+half <- (size - 1) / 2
+x_grid <- y_grid <- -half:half
+
+gauss_kernel <- outer(x_grid, y_grid, function(x, y) exp(-(x^2 + y^2) / (2 * sigma_cells^2)))
+gauss_kernel <- gauss_kernel / sum(gauss_kernel)
+
+# Apply focal smoothing
+bias_smooth <- focal(bias_raster, w = gauss_kernel, fun = sum, na.policy = "omit", pad = TRUE)
+
+# Resample back to 50m and mask to Scotland boundary
+bias_final <- resample(bias_smooth, template_50m, method = "bilinear") %>%
+  mask(roi)
+
+# Normalize bias values between 0 and 1
+max_val <- global(bias_final, "max", na.rm = TRUE)[1,1]
+bias_final <- bias_final / max_val
+
+# Save Bias Raster
+writeRaster(
+  bias_final, 
+  "E:/Shared drives/Twinflower/CleanData/bias_data.tif", 
+  overwrite = TRUE, 
+  datatype = "FLT4S"
+)
+
+# 7. Validation Plots ----------------------------------------------------------
+# Compare bias values at presence locations vs random background
+vals_occ <- terra::extract(bias_final, tf_vect)[,2] # Extract 2nd column (values)
+bg_test  <- spatSample(bias_final, size = 1000, method = "random", na.rm = TRUE, xy = TRUE)
+vals_bg  <- bg_test[,3]
+
+boxplot(vals_occ, vals_bg, names = c("Occurrences", "Background"), main = "Bias Value Distribution")
+
+# 8. Visualization -------------------------------------------------------------
+# Load supplemental layers for context
+pine_path <- "E:/Shared drives/Twinflower/RawData/Caledonian_Pinewood_Inventory/Caledonian_Pinewood_Inventory.shp"
+cnp_path  <- "E:/Shared drives/Twinflower/RawData/CNP_boundary/SG_CairngormsNationalPark_2010.shp"
+
+# Use intersect to both crop and mask in one step
+pine_locations <- vect(pine_path) %>% intersect(roi)
+cnp_boundary   <- vect(cnp_path) %>% intersect(roi)
+
+# Final Map
+final_map <- ggplot() +
+  geom_spatvector(data = roi, fill = "grey95", color = "black") +
+  geom_spatvector(data = pine_locations, fill = "darkgreen", color = NA, alpha = 0.5) +
+  geom_spatvector(data = cnp_boundary, fill = NA, color = "darkred", linewidth = 0.8) +
+  geom_spatvector(data = tf_thinned_vect, color = "blue", size = 0.4, alpha = 0.7) +
+  labs(
+    title = "Twinflower Survey Effort & Constraints",
+    subtitle = "Thinned occurrences, Caledonian Pinewoods, and CNP Boundary",
+    caption = "Resolution: 50m | Projection: OSGB 1936"
+  ) +
+  theme_minimal()
+
+# Save final map
+ggsave("E:/Shared drives/Twinflower/Outputs/early_figures/thinned_occ_map_final.png", 
+       final_map, width = 18, height = 24, units = "cm")
+
+print(final_map)
+
+# 9. Scene-setting map: raw occurrences over coniferous woodland ---------------
+
+# Load raw wild occurrence and translocation points
+tf_occs_raw <- vect("E:/Shared drives/Twinflower/RawData/Tf_occ_data/Shapefiles/TF_Scot_nodupl.shp")
+translocs_raw <- vect("E:/Shared drives/Twinflower/RawData/Tf_occ_data/translocations/TwinflowerTranslocationSites2025.shp")
+
+# Load coniferous woodland proportional cover layer
+land_cover <- rast("E:/Shared drives/Twinflower/CleanData/covariates/land_cover/landcover_50m_proportion.tif")
+
+conifer_layer <- land_cover[[grep("coniferous_woodland_prop", names(land_cover))]]
+names(conifer_layer) <- "coniferous_woodland_prop"
+
+# Align everything to the raster CRS
+if (!same.crs(roi, conifer_layer)) roi <- project(roi, conifer_layer)
+if (!same.crs(tf_occs_raw, conifer_layer)) tf_occs_raw <- project(tf_occs_raw, conifer_layer)
+if (!same.crs(translocs_raw, conifer_layer)) translocs_raw <- project(translocs_raw, conifer_layer)
+
+# Crop/mask to Scotland
+conifer_scot <- crop(conifer_layer, roi, mask = TRUE)
+tf_occs_raw <- crop(tf_occs_raw, roi)
+translocs_raw <- crop(translocs_raw, roi)
+
+# Check how many points are being plotted
+cat("Wild occurrence points plotted:", nrow(tf_occs_raw), "\n")
+cat("Translocation points plotted:", nrow(translocs_raw), "\n")
+
+# Make no-cover cells white/transparent so woodland patches stand out
+conifer_plot <- conifer_scot
+conifer_plot[conifer_plot <= 0] <- NA
+
+# Create bounding box to show where future plots are cropped to
+all_pts <- rbind(tf_occs_raw, translocs_raw)
+ext_pts <- ext(all_pts)
+
+ext_zoom <- ext(
+  xmin(ext_pts) - 10000,
+  xmax(ext_pts) + 10000,
+  ymin(ext_pts) - 10000,
+  ymax(ext_pts) + 10000
+)
+
+ext_box <- as.polygons(ext_zoom)
+crs(ext_box) <- crs(conifer_plot)
+
+png(
+  "E:/Shared drives/Twinflower/Outputs/final_figures/coniferous_and_occurrences.png",
+  width = 3600,
+  height = 4600,
+  res = 600
+)
+
+options(scipen = 999)
+
+layout(
+  matrix(c(1, 2, 3), nrow = 3),
+  heights = c(0.5, 5.2, 0.6)
+)
+
+# --- TEXT SCALING (easy to tweak globally) ---
+cex_title  <- 1.45
+cex_axis   <- 1.25
+cex_ticks  <- 0.95
+cex_legend <- 1.05
+
+# Title panel ------------------------------------------------------------------
+par(mar = c(0, 0, 0, 0))
+plot.new()
+text(
+  0.5, 0.45,
+  "Twinflower occurrences and coniferous woodland cover",
+  cex = cex_title,
+  font = 2
+)
+
+# Main map ---------------------------------------------------------------------
+par(
+  mar = c(7, 6.5, 0.5, 5.5),   # more space for labels
+  mgp = c(4, 1.2, 0),
+  cex.axis = cex_legend,
+  cex.lab = cex_axis,
+  xpd = FALSE
+)
+
+plot(
+  conifer_plot,
+  col = hcl.colors(80, "Greens", rev = TRUE),
+  range = c(0, 1),
+  axes = TRUE,
+  box = FALSE,
+  main = "",
+  xlab = "Easting (m)",
+  ylab = "Northing (m)",
+  colNA = "white",
+  plg = list(
+    title = "",
+    at = seq(0, 1, by = 0.2),
+    labels = seq(0, 1, by = 0.2),
+    cex = cex_ticks,
+    shrink = 0.75,
+    width = 1.1
+  )
+)
+
+plot(roi, add = TRUE, border = "grey35", lwd = 0.4)
+
+# Add crop extent box - used for later zoomed figures
+ext_box <- as.polygons(ext_zoom)
+crs(ext_box) <- crs(conifer_plot)
+
+plot(
+  ext_box,
+  add = TRUE,
+  border = "black",
+  lwd = 1.2,
+  lty = 2
+)
+
+# Points (slightly larger for clarity)
+points(
+  translocs_raw,
+  col = adjustcolor("red", alpha.f = 0.85),
+  bg = adjustcolor("red", alpha.f = 0.85),
+  pch = 24,
+  cex = 1.0,
+  lwd = 0.3
+)
+
+points(
+  tf_occs_raw,
+  col = adjustcolor("orange", alpha.f = 0.75),
+  bg = adjustcolor("orange", alpha.f = 0.75),
+  pch = 21,
+  cex = 0.65,
+  lwd = 0.25
+)
+
+mtext(
+  "Coniferous woodland cover",
+  side = 4,
+  line = 3.8,
+  cex = cex_ticks
+)
+
+# Legend panel -----------------------------------------------------------------
+par(mar = c(0, 0, 0, 0), xpd = TRUE)
+plot.new()
+
+legend(
+  "center",
+  legend = c("Wild occurrences", "Translocations"),
+  pch = c(21, 24),
+  pt.bg = c(
+    adjustcolor("orange", alpha.f = 0.75),
+    adjustcolor("red", alpha.f = 0.85)
+  ),
+  col = c(
+    adjustcolor("orange", alpha.f = 0.75),
+    adjustcolor("red", alpha.f = 0.85)
+  ),
+  pt.cex = c(1.2, 1.4),
+  horiz = TRUE,
+  bty = "n",
+  title = "Site type",
+  cex = cex_legend,
+  title.cex = cex_axis
+)
+
+dev.off()
