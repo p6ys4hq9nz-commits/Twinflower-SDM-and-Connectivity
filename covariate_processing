@@ -1,0 +1,886 @@
+################################################################################
+###              Script 2: Prepare predictor data for MaxEnt                 ###
+################################################################################
+
+# Purpose:
+#   Prepare climate, soil, land-cover and topographic predictor rasters for
+#   MaxEnt modelling. Outputs are cropped/masked to the UK ROI and aligned to a
+#   50 m UK template where required.
+
+# Load packages ----------------------------------------------------------------
+library(tidyterra)
+library(httr)
+library(rvest)
+library(lubridate)
+library(tidyverse)
+library(terra)
+library(stringr)
+library(dplyr)
+library(car)
+
+# Load custom functions --------------------------------------------------------
+# Includes calc_quantiles(), used below for raster quantile calculations.
+source("E:/Shared drives/Twinflower/Scripts/misc_functions/misc_functions.R")
+
+# Paths ------------------------------------------------------------------------
+base_dir <- "E:/Shared drives/Twinflower"
+raw_dir  <- file.path(base_dir, "RawData")
+clean_dir <- file.path(base_dir, "CleanData")
+
+roi_path <- file.path(raw_dir, "ROI_polygon/ROI.shp")
+roi_uk_path <- file.path(
+  raw_dir,
+  "ROI_polygon/bdline_essh_gb/Data/Supplementary_Country/country_region.shp"
+)
+
+clim_clean_dir <- file.path(clean_dir, "covariates")
+clim_pred_dir  <- file.path(clim_clean_dir, "clim_preds")
+
+# Temporary/local climate paths retained from original script.
+temp_rcp85_dir   <- "C:/Users/ts1774/temp/rcp85"
+temp_current_dir <- "C:/Users/ts1774/temp/current"
+temp_root_dir    <- "C:/Users/ts1774/temp"
+
+# Load ROI files ---------------------------------------------------------------
+ROI <- vect(roi_path)
+ROI_UK <- vect(roi_uk_path)
+
+
+#------------------------------------------------------------------------------#
+###                         Helper functions                                ###
+#------------------------------------------------------------------------------#
+
+# Crop, mask and export NetCDF climate layers to a ROI.
+crop_mask_export_climate <- function(input_dir, output_dir, roi, project_to = roi,
+                                     pattern = "\\.nc$") {
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  cov_files <- list.files(
+    input_dir,
+    pattern = pattern,
+    full.names = TRUE,
+    recursive = TRUE
+  )
+  
+  print(head(cov_files))
+  
+  crop_one_file <- function(filepath) {
+    img <- rast(filepath) %>%
+      terra::project(crs(project_to)) %>%
+      crop(roi) %>%
+      mask(roi)
+    
+    # Remove large NoData marker values occasionally present in NetCDF inputs.
+    NAflag(img) <- 1e+20
+    img[img > 1e10] <- NA
+    img[img < -1e10] <- NA
+    
+    outpath <- file.path(
+      output_dir,
+      paste0(tools::file_path_sans_ext(basename(filepath)), "_masked.tif")
+    )
+    
+    writeRaster(img, outpath, overwrite = TRUE)
+    outpath
+  }
+  
+  invisible(lapply(cov_files, crop_one_file))
+}
+
+# Convert future precipitation from kg m-2 s-1 to mm day-1.
+convert_future_rainfall <- function(rain_stack, period) {
+  if (period != "current") {
+    rain_stack[rain_stack > 1e10] <- NA
+    values(rain_stack) <- values(rain_stack) * 86400
+  }
+  rain_stack
+}
+
+# Calculate the longest consecutive dry spell for a raster stack of daily rain.
+calculate_longest_dryspell <- function(year_stack, threshold) {
+  dry_day_count <- terra::init(year_stack[[1]], 0)
+  dry_day_count <- mask(dry_day_count, year_stack[[1]])
+  max_dry_spell <- dry_day_count
+  
+  for (i in seq_len(nlyr(year_stack))) {
+    is_dry <- year_stack[[i]] < threshold
+    dry_day_count <- ifel(is_dry, dry_day_count + 1, 0)
+    max_dry_spell <- max(max_dry_spell, dry_day_count)
+  }
+  
+  max_dry_spell
+}
+
+# Build quarterly rainfall totals for selected quarter labels, e.g. "2070-Q3".
+get_quarterly_rainfall <- function(qtrs_dates, rain_files, period) {
+  quarterly_rainfall_rasters <- list()
+  
+  for (i in seq_along(qtrs_dates)) {
+    year_qtr <- strsplit(qtrs_dates[[i]], "-Q")[[1]]
+    year <- as.numeric(year_qtr[1])
+    qtr  <- as.numeric(year_qtr[2])
+    
+    q_start <- (qtr - 1) * 3 + 1
+    q_end   <- q_start + 2
+    q_rainfall_sum <- NULL
+    
+    for (month in q_start:q_end) {
+      month_pattern <- sprintf("%04d%02d", year, month)
+      month_rain_files <- rain_files[grep(month_pattern, basename(rain_files))]
+      
+      if (length(month_rain_files) > 0) {
+        month_rain_stack <- rast(month_rain_files)
+        month_rain_stack <- convert_future_rainfall(month_rain_stack, period)
+        month_rain_sum <- sum(month_rain_stack, na.rm = TRUE)
+        
+        q_rainfall_sum <- if (is.null(q_rainfall_sum)) {
+          month_rain_sum
+        } else {
+          q_rainfall_sum + month_rain_sum
+        }
+      }
+    }
+    
+    quarterly_rainfall_rasters[[i]] <- q_rainfall_sum
+  }
+  
+  app(rast(quarterly_rainfall_rasters), fun = calc_quantiles)
+}
+
+# Build quarterly temperature summaries for selected quarter labels.
+get_quarterly_temperature <- function(qtrs_dates, temp_stack, start_year,
+                                      quantile = 0.9) {
+  quarterly_temp_rasters <- list()
+  
+  for (i in seq_along(qtrs_dates)) {
+    year_qtr <- strsplit(qtrs_dates[[i]], "-Q")[[1]]
+    year <- as.numeric(year_qtr[1])
+    qtr  <- as.numeric(year_qtr[2])
+    
+    q_start <- (qtr - 1) * 3 + 1
+    q_end   <- q_start + 2
+    month_temp_rasters <- list()
+    
+    for (month in q_start:q_end) {
+      layer_id <- (year - start_year) * 12 + month
+      
+      if (layer_id > nlyr(temp_stack)) {
+        stop(paste("Layer index out of range:", layer_id))
+      }
+      
+      month_temp_rasters[[length(month_temp_rasters) + 1]] <- temp_stack[[layer_id]]
+    }
+    
+    quarterly_temp_rasters[[i]] <- rast(month_temp_rasters) %>% median()
+  }
+  
+  app(rast(quarterly_temp_rasters), fun = calc_quantiles, probs = quantile)
+}
+
+# Rasterise, crop, mask and write a soil layer.
+process_soil_layer <- function(vector_data, field, template, roi, outpath,
+                               make_factor = FALSE) {
+  soil_rast <- rasterize(vector_data[, field], template, field = field, touches = TRUE)
+  
+  if (make_factor) {
+    soil_rast <- as.factor(soil_rast)
+  }
+  
+  soil_rast <- crop(soil_rast, template)
+  soil_rast <- mask(soil_rast, roi)
+  
+  writeRaster(soil_rast, outpath, overwrite = TRUE)
+  soil_rast
+}
+
+
+#------------------------------------------------------------------------------#
+###                         Climate data                                     ###
+#------------------------------------------------------------------------------#
+
+# Crop, mask and export raw/current/future climate layers ----------------------
+crop_mask_export_climate(
+  input_dir  = file.path(raw_dir, "climate_scenarios/rcp45"),
+  output_dir = file.path(clim_clean_dir, "rcp45_masked"),
+  roi = ROI_UK,
+  project_to = ROI_UK
+)
+
+crop_mask_export_climate(
+  input_dir  = temp_rcp85_dir,
+  output_dir = file.path(temp_root_dir, "rcp85_masked"),
+  roi = ROI_UK,
+  project_to = ROI_UK
+)
+
+crop_mask_export_climate(
+  input_dir  = temp_current_dir,
+  output_dir = file.path(temp_root_dir, "current_masked"),
+  roi = ROI_UK,
+  project_to = ROI
+)
+
+# Remove superfluous JSON files from temporary climate folders -----------------
+json_files <- list.files(
+  temp_root_dir,
+  pattern = "\\.json$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+file.remove(json_files)
+
+# Process local climate data ---------------------------------------------------
+rainfall_threshold <- 1 # mm; used to calculate dry spell duration.
+
+for (period in c("current", "rcp45", "rcp85")) {
+  
+  cat("Processing climate period:", period, "\n")
+  
+  period_masked_dir <- file.path(clim_clean_dir, paste0(period, "_masked"))
+  
+  if (period == "current") {
+    temp_files <- list.files(period_masked_dir, pattern = "1km_mon", full.names = TRUE)
+    rain_files <- list.files(period_masked_dir, pattern = "1km_day", full.names = TRUE)
+    
+    years <- sort(unique(str_extract(basename(temp_files), "\\d{4}")))
+    start_year <- min(as.numeric(years))
+    end_year   <- max(as.numeric(years))
+    
+    temp_stack <- rast(temp_files)
+    names(temp_stack) <- sprintf("%d%02d", rep(start_year:end_year, each = 12), 1:12)
+    
+  } else {
+    start_year <- 2070
+    end_year   <- 2073
+    
+    temp_files <- list.files(
+      period_masked_dir,
+      pattern = "tas_uk_1km_monthly",
+      full.names = TRUE
+    )
+    rain_files <- list.files(
+      period_masked_dir,
+      pattern = "pr_uk_1km_daily",
+      full.names = TRUE
+    )
+    
+    temp_stack <- rast(temp_files)
+    
+    # Assign monthly dates because the future scenario rasters do not reliably
+    # carry the required time metadata after processing.
+    n_layers <- nlyr(temp_stack)
+    dates <- seq(as.Date(paste0(start_year, "-01-01")), by = "month", length.out = n_layers)
+    time(temp_stack) <- dates
+    
+    temp_stack <- temp_stack %>% subset(which(year(time(.)) %in% start_year:end_year))
+    names(temp_stack) <- sprintf("%d%02d", rep(start_year:end_year, each = 12), 1:12)
+    
+    # Convert Kelvin to Celsius.
+    values(temp_stack) <- values(temp_stack) - 272.15
+  }
+  
+  # Identify hottest and coldest quarters --------------------------------------
+  quarters <- ceiling(seq_len(nlyr(temp_stack)) / 3)
+  temp_stack_qtr <- tapp(temp_stack, quarters, fun = median)
+  avg_qtr_temp <- global(temp_stack_qtr, stat = "median", na.rm = TRUE)
+  
+  qtr_df <- data.frame(
+    q_index = seq_len(nrow(avg_qtr_temp)),
+    temp = avg_qtr_temp$mean
+  )
+  
+  qtr_df$year <- start_year + ((qtr_df$q_index - 1) %/% 4)
+  qtr_df$qtr  <- (qtr_df$q_index - 1) %% 4 + 1
+  
+  hottest_qtrs_dates <- qtr_df %>%
+    group_by(year) %>%
+    slice_max(temp, n = 1, with_ties = FALSE) %>%
+    mutate(label = paste0(year, "-Q", qtr)) %>%
+    pull(label)
+  
+  coldest_qtrs_dates <- qtr_df %>%
+    group_by(year) %>%
+    slice_min(temp, n = 1, with_ties = FALSE) %>%
+    mutate(label = paste0(year, "-Q", qtr)) %>%
+    pull(label)
+  
+  # Rainfall and temperature of hottest/coldest quarters -----------------------
+  perc09_total_rain_coldest <- get_quarterly_rainfall(
+    coldest_qtrs_dates,
+    rain_files,
+    period
+  )
+  perc09_total_rain_hottest <- get_quarterly_rainfall(
+    hottest_qtrs_dates,
+    rain_files,
+    period
+  )
+  
+  perc01_temp_coldest <- get_quarterly_temperature(
+    coldest_qtrs_dates,
+    temp_stack,
+    start_year,
+    quantile = 0.1
+  )
+  perc09_temp_hottest <- get_quarterly_temperature(
+    hottest_qtrs_dates,
+    temp_stack,
+    start_year,
+    quantile = 0.9
+  )
+  
+  # Longest dry spell during hottest quarter -----------------------------------
+  year_files <- list()
+  dryspell_rasters <- list()
+  
+  for (file in rain_files) {
+    file_year <- str_extract(basename(file), "\\d{4}")
+    year_files[[file_year]] <- c(year_files[[file_year]], file)
+  }
+  
+  for (file_year in names(year_files)) {
+    year_stack <- rast(year_files[[file_year]])
+    year_stack <- convert_future_rainfall(year_stack, period)
+    names(year_stack) <- paste0("day", seq_len(nlyr(year_stack)))
+    
+    hottest_qtr <- hottest_qtrs_dates[grepl(paste0("^", file_year, "-"), hottest_qtrs_dates)]
+    qtr <- as.numeric(sub(".*-Q", "", hottest_qtr))
+    
+    start_month <- (qtr - 1) * 3 + 1
+    end_month   <- start_month + 2
+    start_date  <- as.Date(paste(file_year, start_month, "01", sep = "-"))
+    end_date    <- as.Date(paste(file_year, end_month + 1, "01", sep = "-")) - 1
+    
+    days_in_hottest_qtr <- yday(seq.Date(start_date, end_date, by = "day"))
+    valid_days <- days_in_hottest_qtr[
+      days_in_hottest_qtr >= 1 & days_in_hottest_qtr <= nlyr(year_stack)
+    ]
+    
+    year_stack_hottest <- year_stack[[valid_days]]
+    dryspell_rasters[[file_year]] <- calculate_longest_dryspell(
+      year_stack_hottest,
+      rainfall_threshold
+    )
+  }
+  
+  dry_duration_09perc <- app(rast(dryspell_rasters), fun = calc_quantiles)
+  
+  # Annual temperature mean, SD and range --------------------------------------
+  temp_years <- unique(substr(names(temp_stack), 1, 4))
+  
+  yearly_temp <- tapp(
+    temp_stack,
+    index = temp_years,
+    fun = mean,
+    na.rm = TRUE
+  )
+  
+  annual_mean_temp <- mean(yearly_temp, na.rm = TRUE)
+  year_sd_temp_list <- list()
+  year_temp_range_list <- list()
+  
+  for (file_year in temp_years) {
+    year_temp_stack <- temp_stack[[substr(names(temp_stack), 1, 4) == file_year]]
+    
+    year_sd_temp_list[[file_year]] <- app(year_temp_stack, fun = sd, na.rm = TRUE)
+    year_temp_range_list[[file_year]] <- max(year_temp_stack) - min(year_temp_stack)
+  }
+  
+  mean_year_sd_temp <- mean(rast(year_sd_temp_list))
+  mean_year_range_temp <- mean(rast(year_temp_range_list))
+  
+  clim_stack <- c(
+    perc09_total_rain_coldest,
+    perc09_total_rain_hottest,
+    perc01_temp_coldest,
+    perc09_temp_hottest,
+    dry_duration_09perc,
+    annual_mean_temp,
+    mean_year_sd_temp,
+    mean_year_range_temp
+  )
+  
+  names(clim_stack) <- paste0(
+    period,
+    "_",
+    c(
+      "perc09_total_rain_coldest",
+      "perc09_total_rain_hottest",
+      "perc01_temp_coldest",
+      "perc09_temp_hottest",
+      "dry_duration_09perc",
+      "annual_mean_temp",
+      "annual_sd_temp",
+      "temp_seasonality"
+    )
+  )
+  
+  # Write final climate raster stack ------------------------------------------
+  period_out_dir <- file.path(clim_pred_dir, period)
+  dir.create(period_out_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  writeRaster(
+    clim_stack,
+    file.path(period_out_dir, paste0(names(clim_stack), ".tif")),
+    overwrite = TRUE
+  )
+}
+
+# Create UK template raster for projection and alignment -----------------------
+template <- rast(
+  xmin = xmin(ROI_UK),
+  xmax = xmax(ROI_UK),
+  ymin = ymin(ROI_UK),
+  ymax = ymax(ROI_UK),
+  resolution = 50,
+  crs = crs(ROI_UK)
+)
+
+
+#------------------------------------------------------------------------------#
+###              Soil data layer - pH, carbon, parent material               ###
+#------------------------------------------------------------------------------#
+
+soil_dir <- file.path(raw_dir, "Soil_data")
+soil_out_dir <- file.path(clim_clean_dir, "soil")
+
+# Soil pH ----------------------------------------------------------------------
+soil_pH_raw <- vect(file.path(soil_dir, "soil_pH_type/data/CS_topsoil_pH_bulkDensity.shp"))
+
+soil_ph_rast <- process_soil_layer(
+  vector_data = soil_pH_raw,
+  field = "PH_07",
+  template = template,
+  roi = ROI_UK,
+  outpath = file.path(soil_out_dir, "soil_pH/soil_pH_processed.tif")
+)
+
+summary(values(soil_ph_rast))
+plot(soil_ph_rast)
+
+# Soil carbon ------------------------------------------------------------------
+soil_carbon_raw <- vect(file.path(soil_dir, "soil_carbon/data/CS_topsoil_carbon.shp"))
+
+soil_carbon_rast <- process_soil_layer(
+  vector_data = soil_carbon_raw,
+  field = "CCONC_07",
+  template = template,
+  roi = ROI_UK,
+  outpath = file.path(soil_out_dir, "soil_carbon/soil_carbon_processed.tif")
+)
+
+plot(soil_carbon_rast)
+res(soil_carbon_rast)
+ext(soil_carbon_rast) == ext(template)
+
+# Soil type --------------------------------------------------------------------
+unique(soil_pH_raw$SOIL_GROUP)
+
+soil_type_rast <- process_soil_layer(
+  vector_data = soil_pH_raw,
+  field = "SOIL_GROUP",
+  template = template,
+  roi = ROI_UK,
+  outpath = file.path(soil_out_dir, "soil_type/soil_type_processed.tif"),
+  make_factor = TRUE
+)
+
+plot(soil_type_rast)
+res(soil_type_rast)
+
+# Create soil stack for MaxEnt -------------------------------------------------
+soil_carbon <- rast(file.path(soil_out_dir, "soil_carbon/soil_carbon_processed.tif"))
+soil_pH     <- rast(file.path(soil_out_dir, "soil_pH/soil_pH_processed.tif"))
+soil_type   <- rast(file.path(soil_out_dir, "soil_type/soil_type_processed.tif"))
+
+# Soil group is categorical, so it is excluded from the correlation check.
+soil_stack_for_cor <- c(soil_carbon, soil_pH)
+
+set.seed(42)
+vals <- spatSample(soil_stack_for_cor, size = 50000, method = "random", na.rm = TRUE)
+cor(vals)
+
+# Carbon concentration and pH are highly correlated. Retain pH due to higher
+# ecological relevance.
+soil_stack <- c(soil_pH, soil_type)
+names(soil_stack) <- c("soil_pH", "soil_type")
+
+writeRaster(
+  soil_stack,
+  file.path(soil_out_dir, "soil_stack", paste0(names(soil_stack), ".tif")),
+  overwrite = TRUE
+)
+
+plot(soil_pH)
+plot(soil_type)
+compareGeom(soil_stack, template)
+
+
+#------------------------------------------------------------------------------#
+###                  UKCEH Land Cover data 2024 (10 m)                      ###
+#------------------------------------------------------------------------------#
+
+terraOptions(tempdir = "D:/terra_tmp/land_cover")
+
+land_cover_raw <- rast("D:/terra_tmp/land_cover/Land_cover/data/10m/gblcm2024_10m.tif")
+land_cover_raw
+names(land_cover_raw)
+
+# Identify the raster layer containing the 21 land-cover classes.
+s1 <- spatSample(land_cover_raw[[1]], size = 10000, method = "random")
+s2 <- spatSample(land_cover_raw[[2]], size = 10000, method = "random")
+unique(s1)
+unique(s2)
+
+land_cover_raw <- land_cover_raw[[1]]
+
+# Get valid classes from the raster sample.
+samp <- spatSample(land_cover_raw, size = 100000, method = "random")
+classes <- sort(unique(samp[, 1]))
+classes <- classes[!is.na(classes) & !classes %in% c(0, 255)]
+length(classes)
+
+class_lookup <- c(
+  "1"  = "deciduous_woodland_prop",
+  "2"  = "coniferous_woodland_prop",
+  "3"  = "arable_prop",
+  "4"  = "improved_grassland_prop",
+  "5"  = "neutral_grassland_prop",
+  "6"  = "calcareous_grassland_prop",
+  "7"  = "acid_grassland_prop",
+  "8"  = "fen_prop",
+  "9"  = "heather_prop",
+  "10" = "heather_grassland_prop",
+  "11" = "bog_prop",
+  "12" = "inland_rock_prop",
+  "13" = "saltwater_prop",
+  "14" = "freshwater_prop",
+  "15" = "supralittoral_rock_prop",
+  "16" = "supralittoral_sediment_prop",
+  "17" = "littoral_rock_prop",
+  "18" = "littoral_sediment_prop",
+  "19" = "saltmarsh_prop",
+  "20" = "urban_prop",
+  "21" = "suburban_prop"
+)
+
+if (length(classes) == 0) {
+  stop("No valid land cover classes found after cropping")
+}
+
+# Aggregate each class to a 50 m proportional layer.
+fact <- 5
+land_cover_prop_50m <- NULL
+layer_names <- c()
+
+for (cl in classes) {
+  cat("Processing class:", cl, "\n")
+  
+  result <- tryCatch({
+    binary <- land_cover_raw == cl
+    prop_layer <- aggregate(binary, fact = fact, fun = mean)
+    
+    nm <- class_lookup[as.character(cl)]
+    if (is.na(nm)) nm <- paste0("class_", cl)
+    
+    list(layer = prop_layer, name = nm)
+  }, error = function(e) {
+    cat("FAILED class:", cl, "\n")
+    NULL
+  })
+  
+  if (!is.null(result)) {
+    land_cover_prop_50m <- if (is.null(land_cover_prop_50m)) {
+      result$layer
+    } else {
+      c(land_cover_prop_50m, result$layer)
+    }
+    
+    layer_names <- c(layer_names, result$name)
+  }
+}
+
+names(land_cover_prop_50m) <- layer_names
+print(global(land_cover_prop_50m, c("min", "max"), na.rm = TRUE))
+
+# Remove one proportional class to avoid perfect multicollinearity.
+land_cover_prop_50m <- land_cover_prop_50m[[
+  names(land_cover_prop_50m) != "suburban_prop"
+]]
+
+land_cover_prop_50m <- resample(land_cover_prop_50m, template, method = "bilinear")
+
+writeRaster(
+  land_cover_prop_50m,
+  "D:/terra_tmp/land_cover/landcover_50m_proportion.tif",
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW")
+)
+
+land_cover_prop_50m <- rast("D:/terra_tmp/land_cover/landcover_50m_proportion.tif")
+
+
+#------------------------------------------------------------------------------#
+###                         Topography data                                  ###
+#------------------------------------------------------------------------------#
+
+data_dir <- file.path(raw_dir, "Topography/data")
+temp_dir <- file.path(raw_dir, "Topography/unzipped")
+
+dir.create(temp_dir, showWarnings = FALSE)
+
+zip_files <- list.files(
+  data_dir,
+  pattern = "\\.zip$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+head(zip_files)
+
+# Reset temporary unzip folder before extracting all tiles.
+unlink(temp_dir, recursive = TRUE)
+dir.create(temp_dir, showWarnings = FALSE)
+
+for (z in zip_files) {
+  unzip(z, exdir = temp_dir)
+}
+
+asc_files <- list.files(temp_dir, pattern = "\\.asc$", recursive = TRUE, full.names = TRUE)
+length(asc_files)
+
+terraOptions(tempdir = "C:/temp")
+dir.create("C:/temp", showWarnings = FALSE)
+
+# Mosaic tiles and align to the 50 m UK template.
+tile_list <- lapply(asc_files, rast)
+topo_data_raw <- mosaic(sprc(tile_list))
+crs(topo_data_raw)
+
+topo_data <- project(topo_data_raw, template)
+plot(topo_data)
+
+elevation <- resample(topo_data, template, method = "bilinear")
+
+writeRaster(
+  elevation,
+  file.path(raw_dir, "Topography/rasterised.tif"),
+  overwrite = TRUE
+)
+
+elevation <- rast(file.path(raw_dir, "Topography/rasterised.tif"))
+elevation <- crop(elevation, template)
+elevation <- mask(elevation, ROI_UK)
+plot(elevation)
+
+# Terrain predictors -----------------------------------------------------------
+slope <- terrain(elevation, v = "slope", unit = "degrees")
+aspect <- terrain(elevation, v = "aspect", unit = "radians")
+
+# Circular aspect is decomposed into northness/eastness for SDM use.
+northness <- cos(aspect)
+eastness  <- sin(aspect)
+names(northness) <- "northness"
+names(eastness)  <- "eastness"
+
+tri <- terrain(elevation, v = "TRI")
+
+# Multi-scale topographic position index.
+w_small  <- matrix(1, 5, 5)    # ~500 m
+w_medium <- matrix(1, 11, 11)  # ~1.1 km
+w_large  <- matrix(1, 31, 31)  # ~3.1 km
+
+mean_small  <- focal(elevation, w_small,  fun = mean, na.rm = TRUE)
+mean_medium <- focal(elevation, w_medium, fun = mean, na.rm = TRUE)
+mean_large  <- focal(elevation, w_large,  fun = mean, na.rm = TRUE)
+
+tpi_small  <- elevation - mean_small
+tpi_medium <- elevation - mean_medium
+tpi_large  <- elevation - mean_large
+
+names(tpi_small)  <- "tpi_small"
+names(tpi_medium) <- "tpi_medium"
+names(tpi_large)  <- "tpi_large"
+
+topo_predictors <- c(
+  elevation,
+  slope,
+  northness,
+  eastness,
+  tri,
+  tpi_small,
+  tpi_medium,
+  tpi_large
+)
+
+names(topo_predictors) <- c(
+  "elevation",
+  "slope",
+  "northness",
+  "eastness",
+  "tri",
+  "tpi_small",
+  "tpi_medium",
+  "tpi_large"
+)
+
+writeRaster(
+  topo_predictors,
+  file.path(clim_clean_dir, "topo_preds", paste0(names(topo_predictors), ".tif")),
+  overwrite = TRUE
+)
+
+
+#------------------------------------------------------------------------------#
+###                   Downscale climate variables to 50 m                   ###
+#------------------------------------------------------------------------------#
+
+terraOptions(tempdir = file.path(base_dir, "temp/clim_ds"))
+
+# Load 50 m topography ---------------------------------------------------------
+topo_50m_stack <- rast(c(
+  file.path(clim_clean_dir, "topo_preds/elevation.tif"),
+  file.path(clim_clean_dir, "topo_preds/slope.tif"),
+  file.path(clim_clean_dir, "topo_preds/northness.tif"),
+  file.path(clim_clean_dir, "topo_preds/eastness.tif")
+))
+names(topo_50m_stack) <- c("elevation", "slope", "northness", "eastness")
+
+# Aggregate topography to 1 km to match climate resolution.
+topo_1km_stack <- aggregate(topo_50m_stack, fact = 20, fun = mean)
+
+# Load current climate variables used to fit downscaling models.
+current_files <- list.files(
+  file.path(clim_pred_dir, "current"),
+  pattern = "\\.tif$",
+  full.names = TRUE
+)
+current_files <- current_files[
+  grepl("annual_mean_temp|perc01_temp_coldest|perc09_temp_hottest", current_files)
+]
+
+current_stack <- rast(current_files)
+names(current_stack) <- c("annual_mean_temp", "perc01_temp_coldest", "perc09_temp_hottest")
+
+# Fit regression models --------------------------------------------------------
+models <- list()
+
+for (i in seq_len(nlyr(current_stack))) {
+  cat("Fitting model for:", names(current_stack)[i], "\n")
+  
+  clim <- current_stack[[i]]
+  topo_1km_aligned <- resample(topo_1km_stack, clim, method = "bilinear")
+  
+  df <- spatSample(c(clim, topo_1km_aligned), size = 20000, method = "random", na.rm = TRUE)
+  colnames(df) <- c("clim", "elevation", "slope", "northness", "eastness")
+  
+  models[[names(current_stack)[i]]] <- lm(
+    clim ~ elevation + slope + northness + eastness,
+    data = df
+  )
+}
+
+# Clamp 50 m predictors to the range used for model fitting.
+mins <- global(topo_1km_stack, "min", na.rm = TRUE)
+maxs <- global(topo_1km_stack, "max", na.rm = TRUE)
+
+for (period in c("current", "rcp45", "rcp85")) {
+  cat("Processing:", period, "\n")
+  
+  files <- list.files(
+    file.path(clim_pred_dir, period),
+    pattern = "\\.tif$",
+    full.names = TRUE
+  )
+  files <- files[grepl("annual_mean_temp|perc01_temp_coldest|perc09_temp_hottest", files)]
+  
+  clim_stack <- rast(files)
+  names(clim_stack) <- c("annual_mean_temp", "perc01_temp_coldest", "perc09_temp_hottest")
+  
+  downscaled_stack <- NULL
+  
+  for (i in seq_len(nlyr(clim_stack))) {
+    varname <- names(clim_stack)[i]
+    cat("Downscaling:", varname, "\n")
+    
+    clim_1km <- clim_stack[[i]]
+    model <- models[[varname]]
+    
+    topo_50m_clamped <- topo_50m_stack
+    for (j in seq_len(nlyr(topo_50m_stack))) {
+      topo_50m_clamped[[j]] <- clamp(topo_50m_stack[[j]], mins[j, 1], maxs[j, 1])
+    }
+    
+    # Predict 50 m climate anomaly from topography, then add it to the coarse
+    # climate surface so broad-scale climate patterns are retained.
+    pred_50m <- predict(topo_50m_clamped, model)
+    pred_50m_mean <- aggregate(pred_50m, fact = 20, fun = mean)
+    pred_50m_mean_resampled <- resample(pred_50m_mean, pred_50m, method = "bilinear")
+    pred_50m_anomaly <- pred_50m - pred_50m_mean_resampled
+    
+    clim_1km_resampled <- resample(clim_1km, pred_50m, method = "bilinear")
+    final <- clim_1km_resampled + pred_50m_anomaly
+    
+    downscaled_stack <- if (is.null(downscaled_stack)) final else c(downscaled_stack, final)
+  }
+  
+  names(downscaled_stack) <- names(clim_stack)
+  
+  out_dir <- file.path(base_dir, "temp/clim_ds", period)
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  writeRaster(
+    downscaled_stack,
+    file.path(out_dir, paste0(names(downscaled_stack), ".tif")),
+    overwrite = TRUE
+  )
+}
+
+
+#------------------------------------------------------------------------------#
+###          Add downscaled predictors back to climate stacks                ###
+#------------------------------------------------------------------------------#
+
+periods <- c("current", "rcp45", "rcp85")
+down_dir <- file.path(base_dir, "temp/clim_ds")
+clim_stacks_list <- list()
+
+for (p in periods) {
+  clim_files <- list.files(file.path(clim_pred_dir, p), pattern = "\\.tif$", full.names = TRUE)
+  clim_stack <- rast(clim_files)
+  
+  names(clim_stack) <- tools::file_path_sans_ext(basename(clim_files))
+  names(clim_stack) <- sub(paste0("^", p, "_"), "", names(clim_stack))
+  
+  down_files <- list.files(file.path(down_dir, p), pattern = "\\.tif$", full.names = TRUE)
+  downscaled <- rast(down_files)
+  names(downscaled) <- tools::file_path_sans_ext(basename(down_files))
+  
+  if (!compareGeom(clim_stack, downscaled, stopOnError = FALSE)) {
+    downscaled <- resample(downscaled, clim_stack, method = "bilinear")
+  }
+  
+  to_replace <- intersect(names(clim_stack), names(downscaled))
+  cat("Replacing in", p, ":", to_replace, "\n")
+  
+  if (length(to_replace) > 0) {
+    clim_stack[[to_replace]] <- downscaled[[to_replace]]
+  }
+  
+  clim_stacks_list[[p]] <- clim_stack
+  
+  out_dir <- file.path(clim_pred_dir, paste0(p, "_updated"))
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  for (nm in names(clim_stack)) {
+    writeRaster(
+      clim_stack[[nm]],
+      file.path(out_dir, paste0(nm, ".tif")),
+      overwrite = TRUE
+    )
+  }
+  
+  cat("Finished:", p, "\n")
+}
+
+# Check sources of files to confirm replacement.
+sources(clim_stack)
