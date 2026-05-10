@@ -372,6 +372,25 @@ plot_suitability_zoom <- function(r, boundary, title_text, filename) {
     lwd = 0.6
   )
   
+  # Scale bar ------------------------------------------------------------------
+  usr <- par("usr")
+  
+  bar_len <- 20000  # 20 km
+  
+  x0 <- usr[2] - 0.10 * diff(usr[1:2]) - bar_len
+  y0 <- usr[4] - 0.06 * diff(usr[3:4])
+  
+  segments(x0, y0, x0 + bar_len, y0, lwd = 3)
+  segments(x0, y0 - 700, x0, y0 + 700, lwd = 2)
+  segments(x0 + bar_len, y0 - 700, x0 + bar_len, y0 + 700, lwd = 2)
+  
+  text(
+    x0 + bar_len / 2,
+    y0 - 9000,
+    "20 km",
+    cex = 0.8
+  )
+  
   title(
     xlab = "Easting (m)",
     ylab = "Northing (m)",
@@ -417,11 +436,11 @@ plot_suitability_zoom(
 #------------------------------------------------------------------------------#
 
 # Reproject and crop nodes to match suitability raster.
-tf_occs <- project(tf_occs_precise, crs(current_scot)) |> crop(ROI)
-translocs <- project(translocs_raw, crs(current_scot)) |> crop(ROI)
+tf_occs_precise <- project(tf_occs_precise, crs(current_scot)) |> crop(ROI)
+translocs_raw <- project(translocs_raw, crs(current_scot)) |> crop(ROI)
 
-tf_occs_precise <- tf_occs
-translocs_precise <- translocs
+tf_occs_precise <- tf_occs_precise
+translocs_precise <- translocs_raw
 
 # 200 m threshold is used for local connectivity, representing maximum seed
 # dispersal distance.
@@ -455,7 +474,6 @@ climate_stability <- app(c(current_scot, rcp45_scot, rcp85_scot), fun = mean)
 # Convert current suitability to resistance. High suitability = low resistance.
 resistance <- (1 - current_scot)^2
 resistance <- clamp(resistance, lower = 0.001, upper = 1, values = TRUE)
-resistance <- crop_mask_roi(resistance, ROI)
 
 res_raster <- raster(resistance)
 conductance <- 1 / res_raster
@@ -604,15 +622,9 @@ points(patches, col = "blue", pch = 16, cex = 0.5)
 priority_top <- ifel(priority_surface >= thr, priority_surface, NA)
 elevation <- rast(file.path(clean_dir, "covariates/topo_preds/elevation.tif"))
 
-priority_top <- crop_mask_roi(priority_top, ROI)
-elevation <- crop_mask_roi(elevation, ROI)
-
-# Get legend ranges before cropping to the local map extent.
-elev_rng <- global(elevation, c("min", "max"), na.rm = TRUE)
-elev_lim <- c(elev_rng[1, 1], elev_rng[1, 2])
-
-prio_rng <- global(priority_top, c("min", "max"), na.rm = TRUE)
-prio_lim <- c(prio_rng[1, 1], prio_rng[1, 2])
+# Set rough limit for elevation and 0-1 for suitability scale
+elev_lim <- c(0, 1300)
+prio_lim <- c(0, 1)
 
 # Use all Twinflower nodes to define the final zoom extent.
 zoom_points <- node_candidates
@@ -669,6 +681,26 @@ plot(
 plot(priority_top_crop, add = TRUE, col = prio_cols, legend = FALSE)
 plot(ROI_crop, add = TRUE, border = "black", lwd = 0.15)
 
+# Scale bar ------------------------------------------------------------------
+usr <- par("usr")
+
+bar_len <- 20000  # 20 km
+
+# top-right placement
+x0 <- usr[2] - 0.22 * diff(usr[1:2]) - bar_len
+y0 <- usr[4] - 0.05 * diff(usr[3:4])
+
+segments(x0, y0, x0 + bar_len, y0, lwd = 3)
+segments(x0, y0 - 700, x0, y0 + 700, lwd = 2)
+segments(x0 + bar_len, y0 - 700, x0 + bar_len, y0 + 700, lwd = 2)
+
+text(
+  x0 + bar_len / 2,
+  y0 + 5000,
+  "20 km",
+  cex = 0.8
+)
+
 mtext("Easting (m)", side = 1, line = 4.85, cex = 0.6)
 mtext("Northing (m)", side = 2, line = -2, cex = 0.6)
 
@@ -683,6 +715,12 @@ draw_vertical_legend(
 
 dev.off()
 
+# Save top priotiry site raster
+writeRaster(
+  priority_top_crop,
+  file.path(connect_dir, "priority_top_sites.tif"),
+  overwrite = TRUE
+)
 
 #------------------------------------------------------------------------------#
 ###                         Write outputs                                    ###
@@ -753,6 +791,26 @@ plot(
   ylab = "",
   axes = TRUE,
   plg = list(title = "", cex = 0.8, at = legend_ticks, labels = legend_ticks)
+)
+
+# Scale bar ------------------------------------------------------------------
+usr <- par("usr")
+
+bar_len <- 20000  # 20 km
+
+# top-right placement
+x0 <- usr[2] - 0.10 * diff(usr[1:2]) - bar_len
+y0 <- usr[4] - 0.05 * diff(usr[3:4])
+
+segments(x0, y0, x0 + bar_len, y0, lwd = 3)
+segments(x0, y0 - 700, x0, y0 + 700, lwd = 2)
+segments(x0 + bar_len, y0 - 700, x0 + bar_len, y0 + 700, lwd = 2)
+
+text(
+  x0 + bar_len / 2,
+  y0 + 5000,
+  "20 km",
+  cex = 0.8
 )
 
 title(xlab = "Easting (m)", ylab = "Northing (m)", line = 7, cex.lab = 0.8)
