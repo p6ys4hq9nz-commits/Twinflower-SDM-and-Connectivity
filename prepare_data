@@ -283,6 +283,19 @@ points(
   lwd = 0.25
 )
 
+# Scale bar
+usr <- par("usr")
+bar_len <- 100000
+x0 <- usr[1] + 0.16 * diff(usr[1:2])
+y0 <- usr[3] + 0.06 * diff(usr[3:4])
+
+segments(x0, y0, x0 + bar_len, y0, lwd = 3)
+segments(x0, y0 - 3000, x0, y0 + 3000, lwd = 2)
+segments(x0 + bar_len, y0 - 3000, x0 + bar_len, y0 + 3000, lwd = 2)
+
+text(x0 + bar_len / 2, y0 + 9000, "100 km", cex = cex_ticks)
+
+
 mtext(
   "Coniferous woodland cover",
   side = 4,
