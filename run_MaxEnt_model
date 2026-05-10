@@ -132,6 +132,25 @@ save_png_map <- function(r, filename, title) {
     )
   )
   
+  # Scale bar ------------------------------------------------------------------
+  usr <- par("usr")
+  
+  bar_len <- 100000  # 100 km
+  
+  x0 <- usr[2] - 0.25 * diff(usr[1:2]) - bar_len
+  y0 <- usr[4] - 0.08 * diff(usr[3:4])
+  
+  segments(x0, y0, x0 + bar_len, y0, lwd = 3)
+  segments(x0, y0 - 7000, x0, y0 + 7000, lwd = 2)
+  segments(x0 + bar_len, y0 - 7000, x0 + bar_len, y0 + 7000, lwd = 2)
+  
+  text(
+    x0 + bar_len / 2,
+    y0 + 22000,
+    "100 km",
+    cex = 0.75
+  )
+  
   mtext(
     "Easting (m)",
     side = 1,
@@ -444,6 +463,7 @@ plot_suitability <- function(r, title_text, legend_title = "Suitability") {
 plot_occupied_habitat <- function(suitability_raster, wild_pts, transloc_pts,
                                   filename, title_text, ext_zoom,
                                   legend_settings) {
+  
   raster_zoom <- crop(suitability_raster, ext_zoom)
   
   png(filename, width = 3000, height = 4200, res = 600)
@@ -451,6 +471,7 @@ plot_occupied_habitat <- function(suitability_raster, wild_pts, transloc_pts,
   layout(matrix(c(1, 2), nrow = 2), heights = c(5, 1))
   
   par(mar = c(5, 5, 8, 7))
+  
   plot(
     raster_zoom,
     col = hcl.colors(50, "viridis"),
@@ -467,9 +488,41 @@ plot_occupied_habitat <- function(suitability_raster, wild_pts, transloc_pts,
   mtext("Suitability", side = 4, line = 3, cex = 0.6)
   title(title_text, line = 7, cex.main = 1.0, font.main = 2)
   
-  points(wild_pts, col = adjustcolor("orange", alpha.f = 0.65), pch = 16, cex = 0.7)
-  points(transloc_pts, col = adjustcolor("red", alpha.f = 0.65), pch = 17, cex = 0.7)
+  points(
+    wild_pts,
+    col = adjustcolor("orange", alpha.f = 0.65),
+    pch = 16,
+    cex = 0.7
+  )
   
+  points(
+    transloc_pts,
+    col = adjustcolor("red", alpha.f = 0.65),
+    pch = 17,
+    cex = 0.7
+  )
+  
+  # Scale bar ------------------------------------------------------------------
+  usr <- par("usr")
+  
+  bar_len <- 20000  # 20 km
+  
+  # top-right placement
+  x0 <- usr[2] - 0.20 * diff(usr[1:2]) - bar_len
+  y0 <- usr[4] - 0.05 * diff(usr[3:4])
+  
+  segments(x0, y0, x0 + bar_len, y0, lwd = 3)
+  segments(x0, y0 - 700, x0, y0 + 700, lwd = 2)
+  segments(x0 + bar_len, y0 - 700, x0 + bar_len, y0 + 700, lwd = 2)
+  
+  text(
+    x0 + bar_len / 2,
+    y0 + 5000,
+    "20 km",
+    cex = 0.6
+  )
+  
+  # Legend panel ---------------------------------------------------------------
   par(mar = c(0, 0, 0, 0))
   plot.new()
   
@@ -477,7 +530,10 @@ plot_occupied_habitat <- function(suitability_raster, wild_pts, transloc_pts,
     "top",
     inset = c(0, 0.15),
     legend = c("Wild occurrences", "Translocations"),
-    col = c(adjustcolor("orange", alpha.f = 0.65), adjustcolor("red", alpha.f = 0.65)),
+    col = c(
+      adjustcolor("orange", alpha.f = 0.65),
+      adjustcolor("red", alpha.f = 0.65)
+    ),
     pch = c(16, 17),
     horiz = TRUE,
     bty = "n",
@@ -937,6 +993,40 @@ tr_vals <- terra::extract(suit_stack, translocs_raw)
 colMeans(tf_vals[, c("current", "rcp45", "rcp85")], na.rm = TRUE)
 colMeans(tr_vals[, c("current", "rcp45", "rcp85")], na.rm = TRUE)
 
+# Extract proportion of land area with >0.5 suitability score ------------------
+
+# Current
+# Count cells above threshold
+n_suitable <- global(pred_current_scot > 0.5, "sum", na.rm = TRUE)[1,1]
+
+# Count all land cells
+n_total <- global(!is.na(pred_current_scot), "sum")[1,1]
+
+# Proportion of land area > 0.5 suitability
+prop_suitable <- n_suitable / n_total
+
+# Percentage
+perc_suitable <- prop_suitable * 100
+
+cat("Proportion suitable =", round(prop_suitable, 4), "\n")
+cat("Percent suitable =", round(perc_suitable, 2), "%\n")
+
+
+# RCP8.5
+# Count cells above threshold
+n_suitable <- global(pred_rcp85_scot > 0.5, "sum", na.rm = TRUE)[1,1]
+
+# Count all land cells
+n_total <- global(!is.na(pred_rcp85_scot), "sum")[1,1]
+
+# Proportion of land area > 0.5 suitability
+prop_suitable <- n_suitable / n_total
+
+# Percentage
+perc_suitable <- prop_suitable * 100
+
+cat("Proportion suitable =", round(prop_suitable, 4), "\n")
+cat("Percent suitable =", round(perc_suitable, 2), "%\n")
 
 #------------------------------------------------------------------------------#
 ###                         Variable importance                              ###
